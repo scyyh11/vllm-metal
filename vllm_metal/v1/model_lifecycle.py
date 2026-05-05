@@ -211,10 +211,14 @@ def _align_non_quantized_dtypes(model: Any, target_dtype: Any) -> int:
     import mlx.nn as nn
     from mlx.utils import tree_flatten
 
+    # `tree_flatten` is overloaded `list[tuple[str, Any]] | dict[str, Any]`
+    # depending on the `destination` kwarg; with `destination=None` (default)
+    # it returns the list. Narrow at runtime so mypy can unpack the tuples.
+    leaves = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
+    assert isinstance(leaves, list)
+
     n_cast = 0
-    for _path, module in tree_flatten(
-        model.leaf_modules(), is_leaf=nn.Module.is_module
-    ):
+    for _path, module in leaves:
         if isinstance(module, nn.QuantizedLinear):
             continue
         updates = {}
