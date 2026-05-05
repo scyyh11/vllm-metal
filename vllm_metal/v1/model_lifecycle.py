@@ -20,7 +20,7 @@ from vllm.logger import init_logger
 from vllm_metal.compat import apply_compat_patches
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
-from vllm_metal.quant.awq_config import normalize_quant_config
+from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.stt.detection import is_stt_model
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.model_adapter import ModelAdapter
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_MODEL_CACHE: dict[tuple[str, str, str], tuple[Any, Any]] = {}
+_MODEL_CACHE: dict[tuple[str, str], tuple[Any, Any]] = {}
 _MODEL_CACHE_LOCK = Lock()
 
 
@@ -54,23 +54,13 @@ def reset_model_cache() -> None:
         _MODEL_CACHE.clear()
 
 
-def _generation_cache_key(
-    model_name: str, *, is_vlm: bool, target_dtype: Any
-) -> tuple[str, str, str]:
-    """Cache key for ``_load_generation_model``.
-
-    ``target_dtype`` is part of the key because the AWQ/GPTQ post-load
-    dtype alignment mutates the model in place: a model first loaded with
-    bf16 and then requested as fp16 must NOT be served from cache, since
-    the cached object would carry the wrong dtype on its non-quantized
-    floating params.
-    """
+def _generation_cache_key(model_name: str, *, is_vlm: bool) -> tuple[str, str]:
     loader = "mlx_vlm" if is_vlm else "mlx_lm"
-    return (model_name, loader, str(target_dtype))
+    return (model_name, loader)
 
 
-def _stt_cache_key(model_name: str) -> tuple[str, str, str]:
-    return (model_name, "stt", "")
+def _stt_cache_key(model_name: str) -> tuple[str, str]:
+    return (model_name, "stt")
 
 
 @contextmanager
@@ -141,102 +131,6 @@ def _mlx_lm_compatible_model_path(model_name: str):
         yield str(compat_path)
 
 
-_AWQ_GPTQ_QUANT_METHODS = ("awq", "gptq")
-
-
-def _read_raw_quantization_config(model_name: str) -> Mapping[str, Any] | None:
-    """Read ``quantization_config`` from the model's ``config.json`` without
-    invoking ``mlx_lm.load``. Returns ``None`` if the field is absent or the
-    config cannot be located. Pure read; no model state is constructed.
-
-    Mirrors ``mlx_lm.utils.load_model``'s fallback to
-    ``text_config.quantization_config`` for wrapper / multimodal configs.
-    Without this, multimodal AWQ checkpoints that nest the quant config
-    under ``text_config`` would skip the vllm-metal preflight entirely
-    while mlx_lm itself would still apply the transform.
-    """
-    model_path = Path(model_name)
-    if model_path.is_dir():
-        config_path = model_path / "config.json"
-        if not config_path.is_file():
-            return None
-    else:
-        try:
-            from huggingface_hub import hf_hub_download
-
-            config_path = Path(hf_hub_download(model_name, "config.json"))
-        except Exception:
-            # Fall through: if we cannot reach the config, leave the AWQ
-            # preflight inactive and let mlx_lm.load surface the original
-            # error.
-            return None
-    with open(config_path) as fid:
-        config = json.load(fid)
-    qc = config.get("quantization_config")
-    if isinstance(qc, dict):
-        return qc
-    text_config = config.get("text_config")
-    if isinstance(text_config, dict):
-        nested = text_config.get("quantization_config")
-        if isinstance(nested, dict):
-            return nested
-    return None
-
-
-def _maybe_normalize_awq_model_config(model_name: str) -> dict[str, Any] | None:
-    """If ``model_name`` ships an AWQ/GPTQ ``quantization_config``, normalize
-    it (raises ``UnsupportedQuantizationConfigError`` for unsupported v1 inputs)
-    and return a kwarg dict for ``mlx_lm.load(model_config=...)``. Returns
-    ``None`` for non-AWQ/GPTQ checkpoints.
-    """
-    raw_qc = _read_raw_quantization_config(model_name)
-    if raw_qc is None:
-        return None
-    if raw_qc.get("quant_method") not in _AWQ_GPTQ_QUANT_METHODS:
-        return None
-    normalized = normalize_quant_config(raw_qc)
-    return {"quantization_config": normalized}
-
-
-def _align_non_quantized_dtypes(model: Any, target_dtype: Any) -> int:
-    """Cast floating-dtype params on non-``QuantizedLinear`` leaf modules to
-    ``target_dtype``. Returns the number of cast tensors.
-
-    Quantized layers' ``scales`` / ``biases`` are intentionally left at the
-    dtype produced by mlx_lm's AWQ transform (typically fp16); only the
-    surrounding floating params (embeddings, layernorms, q/k/v biases) are
-    aligned with the engine's runtime dtype.
-    """
-    import mlx.core as mx
-    import mlx.nn as nn
-    from mlx.utils import tree_flatten
-
-    # `tree_flatten` is overloaded `list[tuple[str, Any]] | dict[str, Any]`
-    # depending on the `destination` kwarg; with `destination=None` (default)
-    # it returns the list. Narrow at runtime so mypy can unpack the tuples.
-    leaves = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
-    assert isinstance(leaves, list)
-
-    n_cast = 0
-    for _path, module in leaves:
-        if isinstance(module, nn.QuantizedLinear):
-            continue
-        updates = {}
-        for name, value in module.parameters().items():
-            dtype = getattr(value, "dtype", None)
-            if dtype is None:
-                continue
-            if not mx.issubdtype(dtype, mx.floating):
-                continue
-            if dtype == target_dtype:
-                continue
-            updates[name] = value.astype(target_dtype)
-        if updates:
-            module.update(updates)
-            n_cast += len(updates)
-    return n_cast
-
-
 class ModelLifecycle:
     def __init__(
         self,
@@ -281,18 +175,25 @@ class ModelLifecycle:
     def _load_generation_model(self, model_name: str, is_vlm: bool) -> tuple[Any, Any]:
         logger.info("Loading model: %s (VLM: %s)", model_name, is_vlm)
         start_time = time.time()
-        # Resolve the runtime dtype up front: it is part of the cache key
-        # and the AWQ/GPTQ post-load alignment target, so we must compute it
-        # before any cache lookup.
-        target_dtype = torch_to_mlx(
-            torch.empty(0, dtype=self._runner.model_config.dtype)
-        ).dtype
-        cache_key = _generation_cache_key(
-            model_name, is_vlm=is_vlm, target_dtype=target_dtype
-        )
+
+        # AWQ checkpoints are owned end-to-end by AWQQuantLoader
+        # (preflight, mlx_lm.load invocation, dtype alignment, dtype-scoped
+        # cache key). Detection involves an HF Hub config fetch on cache
+        # miss, so first do a speculative cache lookup against both the
+        # generic and AWQ candidate keys; only invoke detection on miss.
+        generic_key = _generation_cache_key(model_name, is_vlm=is_vlm)
+        target_dtype: Any = None
+        awq_key: tuple[str, str] | None = None
+        if not is_vlm:
+            target_dtype = torch_to_mlx(
+                torch.empty(0, dtype=self._runner.model_config.dtype)
+            ).dtype
+            awq_key = AWQQuantLoader.cache_key(model_name, target_dtype=target_dtype)
 
         with _MODEL_CACHE_LOCK:
-            cached = _MODEL_CACHE.get(cache_key)
+            cached = _MODEL_CACHE.get(generic_key)
+            if cached is None and awq_key is not None:
+                cached = _MODEL_CACHE.get(awq_key)
         if cached is not None:
             logger.info(
                 "Model loaded from cache in %.3fs: %s",
@@ -301,6 +202,11 @@ class ModelLifecycle:
             )
             return cached
 
+        awq_loader = None if is_vlm else AWQQuantLoader.for_model(model_name)
+        cache_key = awq_key if awq_loader is not None else generic_key
+        tokenizer_config = {
+            "trust_remote_code": self._runner.model_config.trust_remote_code
+        }
         if is_vlm:
             logger.info("Using mlx-vlm for vision-language model")
             logger.warning(
@@ -308,30 +214,18 @@ class ModelLifecycle:
                 "not yet supported. Vision encoder will be bypassed."
             )
             model, tokenizer = mlx_vlm_load(model_name)
+        elif awq_loader is not None:
+            with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
+                model, tokenizer = awq_loader.load(
+                    compatible_model_name,
+                    target_dtype=target_dtype,
+                    tokenizer_config=tokenizer_config,
+                )
         else:
-            # AWQ/GPTQ preflight: normalize aliases and reject unsupported
-            # variants before any model state is constructed. Returns None
-            # for non-AWQ/GPTQ checkpoints (no behavior change for those).
-            awq_model_config = _maybe_normalize_awq_model_config(model_name)
             with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
                 model, tokenizer = mlx_lm_load(
                     compatible_model_name,
-                    tokenizer_config={
-                        "trust_remote_code": self._runner.model_config.trust_remote_code
-                    },
-                    model_config=awq_model_config,
-                )
-            # AWQ/GPTQ post-load: mlx_lm derives runtime dtype from the AWQ
-            # `scales` (typically fp16). Align non-quantized floating params
-            # (embeds, layernorms, biases) to the engine's runtime dtype so
-            # the rest of the engine (KV cache, sampler) sees consistent
-            # dtypes. Quantized scales/biases stay at the transform's dtype.
-            if awq_model_config is not None:
-                n_cast = _align_non_quantized_dtypes(model, target_dtype)
-                logger.info(
-                    "AWQ/GPTQ load: aligned %d non-quantized floating params to %s",
-                    n_cast,
-                    target_dtype,
+                    tokenizer_config=tokenizer_config,
                 )
 
         with _MODEL_CACHE_LOCK:

@@ -15,20 +15,8 @@ import vllm_metal.envs as envs
 from tests.stub_runner import make_stub_runner
 from vllm_metal.config import reset_config
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
-
-
-def _default_target_dtype():
-    """Mirror production: `_load_generation_model` derives `target_dtype`
-    from `runner.model_config.dtype` via `torch_to_mlx`. Tests build their
-    runner mock with `dtype=torch.float16` (see `_runner_model_config`),
-    so the cache key the production path would produce uses the same MLX
-    dtype this helper returns.
-    """
-    return torch_to_mlx(torch.empty(0, dtype=torch.float16)).dtype
-
 
 _TEXT_MODEL_ARGS = {
     "vocab_size": 32000,
@@ -109,9 +97,7 @@ def _cache_generation_model(
 ) -> tuple[object, object]:
     fake_model = SimpleNamespace(config=config)
     fake_tokenizer = object() if tokenizer is None else tokenizer
-    cache_key = model_lifecycle._generation_cache_key(
-        "stub-model", is_vlm=is_vlm, target_dtype=_default_target_dtype()
-    )
+    cache_key = model_lifecycle._generation_cache_key("stub-model", is_vlm=is_vlm)
     monkeypatch.setattr(
         model_lifecycle,
         "_MODEL_CACHE",
@@ -278,16 +264,14 @@ class TestModelLifecycle:
             model_lifecycle,
             "_MODEL_CACHE",
             {
-                model_lifecycle._generation_cache_key(
-                    "stub-model",
-                    is_vlm=False,
-                    target_dtype=_default_target_dtype(),
-                ): (text_model, text_tokenizer),
-                model_lifecycle._generation_cache_key(
-                    "stub-model",
-                    is_vlm=True,
-                    target_dtype=_default_target_dtype(),
-                ): (vlm_model, vlm_tokenizer),
+                model_lifecycle._generation_cache_key("stub-model", is_vlm=False): (
+                    text_model,
+                    text_tokenizer,
+                ),
+                model_lifecycle._generation_cache_key("stub-model", is_vlm=True): (
+                    vlm_model,
+                    vlm_tokenizer,
+                ),
             },
         )
 
@@ -441,11 +425,10 @@ class TestModelLifecycle:
             model_lifecycle,
             "_MODEL_CACHE",
             {
-                model_lifecycle._generation_cache_key(
-                    "stub-model",
-                    is_vlm=False,
-                    target_dtype=_default_target_dtype(),
-                ): (fake_model, object())
+                model_lifecycle._generation_cache_key("stub-model", is_vlm=False): (
+                    fake_model,
+                    object(),
+                )
             },
         )
         lifecycle, runner = _make_lifecycle()
@@ -514,6 +497,98 @@ class TestModelLifecycle:
         assert runner._is_vlm is False
         assert runner._is_stt is True
         assert runner._stt_runtime_adapter == (adapter, "stub-model")
+
+    @pytest.mark.parametrize(
+        "is_awq", [True, False], ids=["awq-checkpoint", "non-awq-checkpoint"]
+    )
+    def test_load_dispatches_by_awq_detection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        is_awq: bool,
+    ) -> None:
+        """Pin both sides of the lifecycle dispatch contract introduced
+        by the owner-shape refactor.
+
+        When ``AWQQuantLoader.for_model`` reports an AWQ checkpoint,
+        ``ModelLifecycle._load_generation_model`` delegates the actual
+        load to ``AWQQuantLoader.load`` and never falls back to the
+        generic ``mlx_lm.load``. When it returns ``None`` (non-AWQ),
+        lifecycle uses the generic ``mlx_lm.load`` and never passes
+        ``model_config`` (which is reserved for the AWQ owner's
+        normalized quant config kwargs). AWQ *detection* — not the
+        model-name string or any other heuristic — is what gates the
+        dispatch.
+        """
+        fake_model = SimpleNamespace(config=_text_config())
+        fake_tokenizer = object()
+        awq_load_calls: list[dict[str, object]] = []
+        mlx_lm_load_calls: list[dict[str, object]] = []
+
+        class _StubAWQLoader:
+            @classmethod
+            def for_model(cls, _model_name: str) -> _StubAWQLoader | None:
+                return cls() if is_awq else None
+
+            @staticmethod
+            def cache_key(model_name: str, *, target_dtype: object) -> tuple[str, str]:
+                return (model_name, f"mlx_lm-awq:{target_dtype}")
+
+            def load(
+                self,
+                model_path: str,
+                *,
+                target_dtype: object,
+                tokenizer_config: dict[str, object] | None,
+            ) -> tuple[object, object]:
+                awq_load_calls.append(
+                    {
+                        "model_path": model_path,
+                        "target_dtype": target_dtype,
+                        "tokenizer_config": (
+                            dict(tokenizer_config) if tokenizer_config else None
+                        ),
+                    }
+                )
+                return fake_model, fake_tokenizer
+
+        def _fake_mlx_lm_load(*args: object, **kwargs: object) -> tuple[object, object]:
+            mlx_lm_load_calls.append({"args": args, "kwargs": kwargs})
+            return fake_model, fake_tokenizer
+
+        monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
+        monkeypatch.setattr(model_lifecycle, "_MODEL_CACHE", {})
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_mlx_lm_load)
+
+        lifecycle, runner = _make_lifecycle()
+        lifecycle.load()
+
+        assert runner.model is fake_model
+        assert runner.tokenizer is fake_tokenizer
+
+        if is_awq:
+            assert len(awq_load_calls) == 1, (
+                f"expected exactly one AWQQuantLoader.load() call, "
+                f"got {len(awq_load_calls)}"
+            )
+            assert mlx_lm_load_calls == [], (
+                "generic mlx_lm.load must NOT be called when AWQQuantLoader "
+                "owns the load path"
+            )
+            call = awq_load_calls[0]
+            assert call["model_path"] == "stub-model"
+            assert call["target_dtype"] is not None, (
+                "lifecycle must derive target_dtype from "
+                "runner.model_config.dtype and thread it to the loader"
+            )
+            assert call["tokenizer_config"] == {"trust_remote_code": False}
+        else:
+            assert awq_load_calls == [], (
+                "AWQQuantLoader.load must NOT be called for a non-AWQ checkpoint"
+            )
+            assert len(mlx_lm_load_calls) == 1
+            # The generic path must NOT pass ``model_config`` (which is
+            # reserved for the AWQ owner's normalized quant config kwargs).
+            assert "model_config" not in mlx_lm_load_calls[0]["kwargs"]
 
 
 class TestResolveModelDims:
