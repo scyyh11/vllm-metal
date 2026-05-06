@@ -15,6 +15,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 import torch
+from huggingface_hub.utils import HFValidationError
 
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_config import UnsupportedQuantizationConfigError
@@ -115,13 +116,21 @@ def test_for_model_returns_none_for_no_quant_config(tmp_path):
     assert AWQQuantLoader.for_model(str(model_dir)) is None
 
 
-def test_for_model_returns_none_for_missing_dir():
-    """Non-existent path / non-HF repo: silently inactive, returns None.
+def test_for_model_propagates_hub_fetch_errors():
+    """A malformed repo id / unreachable model_name surfaces the
+    underlying Hub error to the caller rather than silently demoting to
+    the generic loader path. Silent fall-through on a transient Hub
+    failure would let an AWQ checkpoint bypass the dtype-alignment
+    contract this owner enforces.
 
-    The owner is consulted at every load and must not raise on plain
-    local paths that simply do not exist as Hub repos either.
+    ``Path("/nonexistent/path/zzz").is_dir()`` is False so we fall
+    through to ``hf_hub_download``, which raises ``HFValidationError``
+    on a path with multiple slashes (no network call needed). A
+    legitimate local snapshot without a ``config.json`` is handled by
+    the directory branch and still returns ``None`` silently.
     """
-    assert AWQQuantLoader.for_model("/nonexistent/path/zzz") is None
+    with pytest.raises(HFValidationError):
+        AWQQuantLoader.for_model("/nonexistent/path/zzz")
 
 
 def test_for_model_picks_up_nested_text_config(tmp_path):

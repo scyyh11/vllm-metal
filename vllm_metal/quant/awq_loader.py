@@ -26,8 +26,6 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import HfHubHTTPError
-from huggingface_hub.utils import HFValidationError
 from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from vllm.logger import init_logger
@@ -147,13 +145,22 @@ class AWQQuantLoader:
     def _read_raw_quantization_config(model_name: str) -> Mapping[str, Any] | None:
         """Read ``quantization_config`` from the model's ``config.json``
         without invoking ``mlx_lm.load``. Returns ``None`` if the field is
-        absent or the config cannot be located.
+        absent (the checkpoint genuinely is not quantized) or the local
+        directory exists but has no ``config.json``.
 
         Mirrors ``mlx_lm.utils.load_model``'s fallback to
         ``text_config.quantization_config`` for wrapper / multimodal
         configs. Without this, multimodal AWQ checkpoints that nest the
         quant config under ``text_config`` would skip the preflight
         entirely while mlx_lm itself would still apply the transform.
+
+        Hub-fetch errors (``HfHubHTTPError``, ``HFValidationError``,
+        ``OSError``) are intentionally NOT caught here. A transient Hub
+        failure or a malformed repo id should surface to the caller, not
+        silently demote an AWQ checkpoint to the generic loader path,
+        which would bypass the dtype-alignment contract this owner
+        enforces. The local-directory branch above is the single
+        legitimate "no config" case and remains a silent ``None``.
         """
         model_path = Path(model_name)
         if model_path.is_dir():
@@ -161,14 +168,7 @@ class AWQQuantLoader:
             if not config_path.is_file():
                 return None
         else:
-            try:
-                config_path = Path(hf_hub_download(model_name, "config.json"))
-            except (HfHubHTTPError, HFValidationError, OSError):
-                # ``model_name`` cannot be reached as a repo id: Hub-side
-                # failure (404, auth, transport), an unparseable repo id,
-                # or a filesystem error. Leave the preflight inactive and
-                # let ``mlx_lm.load`` surface its own error later.
-                return None
+            config_path = Path(hf_hub_download(model_name, "config.json"))
         with open(config_path) as fid:
             config = json.load(fid)
         qc = config.get("quantization_config")

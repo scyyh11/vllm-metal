@@ -180,7 +180,10 @@ class ModelLifecycle:
         # (preflight, mlx_lm.load invocation, dtype alignment, dtype-scoped
         # cache key). Detection involves an HF Hub config fetch on cache
         # miss, so first do a speculative cache lookup against both the
-        # generic and AWQ candidate keys; only invoke detection on miss.
+        # AWQ and generic candidate keys; only invoke detection on miss.
+        # Probe the AWQ-specific key first so a previously cached AWQ load
+        # is served correctly even if the current detection call would
+        # have failed (e.g. transient Hub error after the cache was warmed).
         generic_key = _generation_cache_key(model_name, is_vlm=is_vlm)
         target_dtype: Any = None
         awq_key: tuple[str, str] | None = None
@@ -191,9 +194,9 @@ class ModelLifecycle:
             awq_key = AWQQuantLoader.cache_key(model_name, target_dtype=target_dtype)
 
         with _MODEL_CACHE_LOCK:
-            cached = _MODEL_CACHE.get(generic_key)
-            if cached is None and awq_key is not None:
-                cached = _MODEL_CACHE.get(awq_key)
+            cached = _MODEL_CACHE.get(awq_key) if awq_key is not None else None
+            if cached is None:
+                cached = _MODEL_CACHE.get(generic_key)
         if cached is not None:
             logger.info(
                 "Model loaded from cache in %.3fs: %s",
