@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 import torch
 
@@ -238,20 +239,6 @@ def test_for_model_accepts_aliased_config(tmp_path):
 
 
 # ---- _align_non_quantized_dtypes -------------------------------------------
-#
-# Every MLX-quantize-protocol leaf — ``QuantizedLinear``,
-# ``QuantizedEmbedding``, mlx_lm's MoE / MLA peers — has ``scales`` /
-# ``biases`` parameters owned by the AWQ transform that must NOT be cast
-# to the runtime dtype. The duck-typed signal for "this is quantized"
-# is the instance-level ``bits`` / ``group_size`` attributes set by
-# every class adhering to the protocol.
-#
-# A quantized layer's ordinary ``bias`` (Qwen2 q/k/v projections, MoE
-# per-expert biases) is a normal floating param and IS cast, otherwise
-# the projection emits mixed-dtype activations into a bf16 KV cache.
-
-
-import mlx.nn as nn  # noqa: E402  (kept near its sole user)
 
 
 class _SingleLeaf(nn.Module):

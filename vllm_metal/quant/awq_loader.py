@@ -23,9 +23,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import mlx.core as mx
+import mlx.nn as nn
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import HFValidationError
+from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from vllm.logger import init_logger
 
@@ -213,10 +216,6 @@ class AWQQuantLoader:
         the projection emits mixed-dtype activations into a bf16 KV cache
         / sampler.
         """
-        import mlx.core as mx
-        import mlx.nn as nn
-        from mlx.utils import tree_flatten
-
         # `tree_flatten` is overloaded `list[tuple[str, Any]] | dict[str, Any]`
         # depending on the `destination` kwarg; with `destination=None`
         # (default) it returns the list. Narrow at runtime so mypy can
