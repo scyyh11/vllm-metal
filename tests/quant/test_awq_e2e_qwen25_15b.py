@@ -126,34 +126,42 @@ def test_awq_e2e_paged_runner_smoke():
     """
     from vllm import LLM, SamplingParams
 
+    llm = None
     monkeypatch_ctx = pytest.MonkeyPatch.context()
-    with monkeypatch_ctx as mp:
-        mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-        mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.3")
+    try:
+        with monkeypatch_ctx as mp:
+            mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+            mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+            mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.3")
 
-        llm = LLM(
-            model=_AWQ_REPO,
-            max_model_len=512,
-            max_num_seqs=1,
-        )
-        sp = SamplingParams(temperature=0, max_tokens=16)
-        outputs = llm.generate(["The capital of France is"], sp)
+            llm = LLM(
+                model=_AWQ_REPO,
+                max_model_len=512,
+                max_num_seqs=1,
+            )
+            sp = SamplingParams(temperature=0, max_tokens=16)
+            outputs = llm.generate(["The capital of France is"], sp)
 
-        assert len(outputs) == 1
-        text = outputs[0].outputs[0].text
-        assert text, "AWQ load produced empty output"
-        # Greedy first-token should be " Paris" (verified by the standalone
-        # parity scripts; reproduced here as a regression guard).
-        assert "Paris" in text, (
-            f"expected 'Paris' in AWQ greedy continuation, got: {text!r}"
-        )
-
-    # Free model state between tests; subsequent tests in this file should
-    # not depend on cache behavior.
-    del llm
-    gc.collect()
-    if hasattr(mx, "clear_cache"):
-        mx.clear_cache()
-    elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
-        mx.metal.clear_cache()
+            assert len(outputs) == 1
+            text = outputs[0].outputs[0].text
+            assert text, "AWQ load produced empty output"
+            # Greedy first-token should be " Paris" (verified by the standalone
+            # parity scripts; reproduced here as a regression guard).
+            assert "Paris" in text, (
+                f"expected 'Paris' in AWQ greedy continuation, got: {text!r}"
+            )
+    finally:
+        # Order matters: ``ModelLifecycle`` stores the AWQ model in the
+        # process-level ``_MODEL_CACHE``, so ``del llm`` alone cannot
+        # release the weights — the cache holds an independent strong
+        # reference. Drop the cache entry first so the subsequent
+        # ``del`` + ``gc.collect`` actually reclaim the model; otherwise
+        # later slow tests in the same pytest process can OOM on 16 GB
+        # Metal machines.
+        model_lifecycle.reset_model_cache()
+        del llm
+        gc.collect()
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+        elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+            mx.metal.clear_cache()
