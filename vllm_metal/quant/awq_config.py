@@ -13,7 +13,7 @@ Supported configuration (AWQ and GPTQ share the same v1 scope):
 
   bits        : 4
   group_size  : 128
-  zero_point  : true
+  zero_point  : true            (or AutoGPTQ alias ``sym: false``)
   version     : "gemm"   (case-insensitive on input)
 
 Rejected:
@@ -22,7 +22,8 @@ Rejected:
   bits != 4              (mlx_lm rejects too, but we want a clearer error
                           and to fail before mlx_lm.load constructs the model)
   group_size != 128
-  zero_point: false
+  zero_point: false      (or AutoGPTQ alias ``sym: true`` — symmetric
+                          quantization is not in v1 scope)
   GPTQ with ``desc_act: true``  (config-level act-order signal)
 
 Out of scope for the v1 preflight: GPTQ checkpoints whose act-order is
@@ -100,11 +101,41 @@ def normalize_quant_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             "group_size=128"
         )
 
-    zero_point = raw.get("zero_point", True)
+    # Resolve the symmetry signal. ``zero_point`` (AWQ canonical) and
+    # ``sym`` (AutoGPTQ alias) express the same property inverted —
+    # ``zero_point=true`` <-> ``sym=false`` (asymmetric, v1-supported);
+    # ``zero_point=false`` <-> ``sym=true`` (symmetric, v1-rejected).
+    # AutoGPTQ checkpoints commonly omit ``zero_point`` and use ``sym``
+    # alone; defaulting ``zero_point`` to True without consulting ``sym``
+    # would silently accept symmetric GPTQ configs the rest of the
+    # preflight claims to reject.
+    zero_point_raw = raw.get("zero_point")
+    sym = raw.get("sym")
+    if sym is not None and not isinstance(sym, bool):
+        raise UnsupportedQuantizationConfigError(f"sym={sym!r} must be a boolean")
+    if sym is True:
+        if zero_point_raw is True:
+            raise UnsupportedQuantizationConfigError(
+                "conflicting symmetry signals: sym=true (symmetric) but "
+                "zero_point=true (asymmetric)"
+            )
+        zero_point = False
+    elif sym is False:
+        if zero_point_raw is False:
+            raise UnsupportedQuantizationConfigError(
+                "conflicting symmetry signals: sym=false (asymmetric) but "
+                "zero_point=false (symmetric)"
+            )
+        zero_point = True
+    elif zero_point_raw is None:
+        zero_point = True
+    else:
+        zero_point = zero_point_raw
     if zero_point is not True:
         raise UnsupportedQuantizationConfigError(
-            f"zero_point={zero_point!r} is not supported; v1 requires "
-            "zero_point=true (asymmetric quantization)"
+            "symmetric quantization is not supported; v1 requires "
+            "asymmetric (zero_point=true, or sym=false in AutoGPTQ "
+            f"convention). Got zero_point={zero_point_raw!r}, sym={sym!r}."
         )
 
     version_raw = raw.get("version", "gemm")

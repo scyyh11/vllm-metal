@@ -90,6 +90,25 @@ _CANONICAL = {
             "group_size": 128,
             "version": "gemm",
         },
+        # AutoGPTQ asymmetric: ``sym=false`` is the AutoGPTQ alias for
+        # ``zero_point=true`` and is the typical realistic GPTQ config
+        # (no ``zero_point`` field).
+        {
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": 128,
+            "sym": False,
+            "version": "gemm",
+        },
+        # AutoGPTQ asymmetric with both fields set consistently.
+        {
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": 128,
+            "zero_point": True,
+            "sym": False,
+            "version": "gemm",
+        },
     ],
     ids=[
         "canonical-awq",
@@ -100,6 +119,8 @@ _CANONICAL = {
         "canonical-gptq",
         "default-version",
         "default-zero_point",
+        "gptq-sym-false",
+        "gptq-zero_point-and-sym-consistent",
     ],
 )
 def test_normalize_returns_canonical(raw):
@@ -169,6 +190,60 @@ def test_normalize_returns_canonical(raw):
             },
             "desc_act",
         ),
+        # AutoGPTQ symmetric (sym=true, no zero_point): the common
+        # AutoGPTQ default for symmetric checkpoints — must NOT be
+        # silently accepted as asymmetric.
+        (
+            {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+            },
+            "symmetric",
+        ),
+        # AutoGPTQ symmetric expressed via zero_point=false alone.
+        (
+            {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128,
+                "zero_point": False,
+            },
+            "symmetric",
+        ),
+        # Conflicting symmetry signals: sym=true with zero_point=true.
+        (
+            {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "zero_point": True,
+            },
+            "conflicting",
+        ),
+        # Conflicting symmetry signals: sym=false with zero_point=false.
+        (
+            {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128,
+                "sym": False,
+                "zero_point": False,
+            },
+            "conflicting",
+        ),
+        # Non-bool sym is malformed.
+        (
+            {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128,
+                "sym": "yes",
+            },
+            "sym=",
+        ),
     ],
     ids=[
         "wrong-quant_method-fp8",
@@ -182,6 +257,11 @@ def test_normalize_returns_canonical(raw):
         "version-gemv",
         "version-uppercase-GEMV",
         "gptq-desc_act-true",
+        "gptq-sym-true",
+        "gptq-zero_point-false",
+        "gptq-conflicting-sym-true-zp-true",
+        "gptq-conflicting-sym-false-zp-false",
+        "gptq-non-bool-sym",
     ],
 )
 def test_reject_paths(raw, needle):
