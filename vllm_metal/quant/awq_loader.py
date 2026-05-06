@@ -73,14 +73,41 @@ def _read_raw_quantization_config(model_name: str) -> Mapping[str, Any] | None:
     return None
 
 
-def _align_non_quantized_dtypes(model: Any, target_dtype: Any) -> int:
-    """Cast floating-dtype params on non-``QuantizedLinear`` leaf modules to
-    ``target_dtype``. Returns the number of cast tensors.
+_AWQ_QUANT_BUFFER_NAMES = ("scales", "biases")
 
-    Quantized layers' ``scales`` / ``biases`` are intentionally left at the
-    dtype produced by mlx_lm's AWQ transform (typically fp16); only the
-    surrounding floating params (embeddings, layernorms, q/k/v biases) are
-    aligned with the engine's runtime dtype.
+
+def _is_mlx_quantized_module(module: Any) -> bool:
+    """Whether ``module`` follows the MLX quantize protocol.
+
+    The protocol's defining surface is the instance-level ``bits`` and
+    ``group_size`` attributes set during construction. This duck-typed
+    check covers ``mlx.nn.QuantizedLinear`` /
+    ``mlx.nn.QuantizedEmbedding`` together with the mlx_lm peers
+    ``QuantizedSwitchLinear`` (MoE) and ``QuantizedMultiLinear`` (MLA),
+    none of which subclass ``nn.QuantizedLinear`` — an ``isinstance``
+    check would silently misclassify those as plain modules and let
+    their AWQ-transform ``scales`` / ``biases`` be cast to the runtime
+    dtype. A separate import dependency on the mlx_lm peers would make
+    the alignment fragile across mlx_lm versions; the protocol
+    attributes are stable.
+    """
+    return hasattr(module, "bits") and hasattr(module, "group_size")
+
+
+def _align_non_quantized_dtypes(model: Any, target_dtype: Any) -> int:
+    """Cast floating-dtype params on leaf modules to ``target_dtype``.
+    Returns the number of cast tensors.
+
+    The AWQ transform produces ``scales`` and ``biases`` parameters at
+    the transform's dtype (typically fp16) for every MLX-quantize-protocol
+    leaf — ``nn.QuantizedLinear``, ``nn.QuantizedEmbedding``, and the
+    mlx_lm MoE / MLA peers. Those buffers are exempt from alignment.
+
+    Surrounding floating params follow the engine's runtime dtype: layer
+    norms, embeddings (when not quantized), and the quantized layer's
+    own ordinary ``bias`` (Qwen2 q/k/v projections, MoE per-expert
+    biases, etc.). Without aligning the regular ``bias`` the projection
+    emits mixed-dtype activations into a bf16 KV cache / sampler.
     """
     import mlx.core as mx
     import mlx.nn as nn
@@ -94,10 +121,11 @@ def _align_non_quantized_dtypes(model: Any, target_dtype: Any) -> int:
 
     n_cast = 0
     for _path, module in leaves:
-        if isinstance(module, nn.QuantizedLinear):
-            continue
+        is_quantized = _is_mlx_quantized_module(module)
         updates = {}
         for name, value in module.parameters().items():
+            if is_quantized and name in _AWQ_QUANT_BUFFER_NAMES:
+                continue
             dtype = getattr(value, "dtype", None)
             if dtype is None:
                 continue

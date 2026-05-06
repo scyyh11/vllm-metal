@@ -92,14 +92,29 @@ def test_awq_load_aligns_non_quant_dtypes_to_runner_target(monkeypatch):
         "expected at least one non-quant floating param (embed/layernorm/bias) "
         "in 1.5B-AWQ"
     )
-    # Quantized scales/biases stay at the AWQ transform's dtype (fp16 for
-    # this checkpoint). The alignment step is intentionally selective; if
-    # it ever started casting these, this assertion would catch it.
     assert quant_dtype_pins, "no quantized floating params observed"
-    fp16_pins = {p for p in quant_dtype_pins if p[1] == mx.float16}
-    assert fp16_pins == quant_dtype_pins, (
-        "quantized scales/biases must remain at the transform's dtype "
-        f"(fp16 for this checkpoint); found mixed: {quant_dtype_pins}"
+    # ``scales`` / ``biases`` are the AWQ-transform output and stay at
+    # the transform's dtype (fp16 for this checkpoint). The alignment
+    # step is intentionally selective; if it ever started casting these,
+    # this assertion would catch it.
+    quant_buffer_pins = {p for p in quant_dtype_pins if p[0] in ("scales", "biases")}
+    assert quant_buffer_pins, "no QuantizedLinear scales/biases observed"
+    assert all(p[1] == mx.float16 for p in quant_buffer_pins), (
+        "AWQ-transform quant buffers must remain at the transform's dtype "
+        f"(fp16 for this checkpoint); found: {quant_buffer_pins}"
+    )
+    # The regular linear ``bias`` on a QuantizedLinear (Qwen2 q/k/v
+    # projections) is a normal floating param and MUST be aligned with
+    # the engine runtime dtype, otherwise the projection emits
+    # mixed-dtype activations into a bf16 KV cache / sampler.
+    regular_bias_pins = {p for p in quant_dtype_pins if p[0] == "bias"}
+    assert regular_bias_pins, (
+        "expected at least one QuantizedLinear with a regular bias on "
+        "Qwen2.5-AWQ (q/k/v projections)"
+    )
+    assert all(p[1] == mx.bfloat16 for p in regular_bias_pins), (
+        "QuantizedLinear regular bias must be cast to the runtime target "
+        f"dtype (bfloat16); found: {regular_bias_pins}"
     )
 
 

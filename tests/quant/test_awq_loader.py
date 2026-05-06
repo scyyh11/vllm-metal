@@ -19,6 +19,7 @@ from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_config import UnsupportedQuantizationConfigError
 from vllm_metal.quant.awq_loader import (
     AWQQuantLoader,
+    _align_non_quantized_dtypes,
     _read_raw_quantization_config,
 )
 
@@ -221,3 +222,195 @@ def test_for_model_accepts_aliased_config(tmp_path):
         {"model_type": "qwen2", "quantization_config": aliased},
     )
     assert AWQQuantLoader.for_model(str(model_dir)) is not None
+
+
+# ---- _align_non_quantized_dtypes -------------------------------------------
+#
+# Every MLX-quantize-protocol leaf — ``QuantizedLinear``,
+# ``QuantizedEmbedding``, mlx_lm's MoE / MLA peers — has ``scales`` /
+# ``biases`` parameters owned by the AWQ transform that must NOT be cast
+# to the runtime dtype. The duck-typed signal for "this is quantized"
+# is the instance-level ``bits`` / ``group_size`` attributes set by
+# every class adhering to the protocol.
+#
+# A quantized layer's ordinary ``bias`` (Qwen2 q/k/v projections, MoE
+# per-expert biases) is a normal floating param and IS cast, otherwise
+# the projection emits mixed-dtype activations into a bf16 KV cache.
+
+
+import mlx.nn as nn  # noqa: E402  (kept near its sole user)
+
+
+class _SingleLeaf(nn.Module):
+    """Tiny container so ``leaf_modules()`` yields one leaf to align."""
+
+    def __init__(self, leaf: nn.Module) -> None:
+        super().__init__()
+        self.leaf = leaf
+
+
+def _make_quantized_linear(*, bias: bool) -> nn.QuantizedLinear:
+    """Build a QuantizedLinear and force its float buffers to fp16 to
+    mirror the dtype distribution that ``mlx_lm._transform_awq_weights``
+    produces from a real AWQ checkpoint."""
+    qlinear = nn.QuantizedLinear(
+        input_dims=128, output_dims=64, bias=bias, group_size=64, bits=4
+    )
+    fp16_updates = {
+        "scales": qlinear.scales.astype(mx.float16),
+        "biases": qlinear.biases.astype(mx.float16),
+    }
+    if bias:
+        fp16_updates["bias"] = qlinear.bias.astype(mx.float16)
+    qlinear.update(fp16_updates)
+    return qlinear
+
+
+def test_align_dtypes_casts_quantized_linear_regular_bias():
+    """A ``QuantizedLinear`` with ``bias=True`` (Qwen2 q/k/v shape) must
+    have its ``bias`` parameter cast to the runtime target dtype, while
+    ``scales``/``biases`` stay at the AWQ transform's dtype.
+    """
+    qlinear = _make_quantized_linear(bias=True)
+    wrapper = _SingleLeaf(qlinear)
+
+    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+
+    assert qlinear.scales.dtype == mx.float16
+    assert qlinear.biases.dtype == mx.float16
+    assert qlinear.bias.dtype == mx.bfloat16
+    assert n_cast == 1
+
+
+def test_align_dtypes_leaves_quantized_linear_without_regular_bias():
+    """A ``QuantizedLinear`` with ``bias=False`` has nothing for align to
+    touch; ``scales``/``biases`` stay at the transform's dtype.
+    """
+    qlinear = _make_quantized_linear(bias=False)
+    wrapper = _SingleLeaf(qlinear)
+
+    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+
+    assert qlinear.scales.dtype == mx.float16
+    assert qlinear.biases.dtype == mx.float16
+    assert n_cast == 0
+
+
+def test_align_dtypes_casts_non_quantized_floating_params():
+    """A plain ``nn.Linear`` next to a quant layer should still have its
+    own ``weight`` and ``bias`` aligned (the prior behavior, asserted
+    here so the QuantizedLinear-specific handling does not regress it).
+    """
+    plain = nn.Linear(input_dims=8, output_dims=4, bias=True)
+    plain.update(
+        {
+            "weight": plain.weight.astype(mx.float16),
+            "bias": plain.bias.astype(mx.float16),
+        }
+    )
+    wrapper = _SingleLeaf(plain)
+
+    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+
+    assert plain.weight.dtype == mx.bfloat16
+    assert plain.bias.dtype == mx.bfloat16
+    assert n_cast == 2
+
+
+def test_align_dtypes_treats_quantized_embedding_as_quantized():
+    """``nn.QuantizedEmbedding`` is NOT a subclass of ``nn.QuantizedLinear``;
+    an ``isinstance`` check would silently let its ``scales`` / ``biases``
+    be cast away from the AWQ transform's dtype. The duck-typed
+    protocol detector (``bits`` / ``group_size`` attributes) must still
+    classify it as quantized so the AWQ buffers are exempted.
+    """
+    qemb = nn.QuantizedEmbedding(num_embeddings=64, dims=128, group_size=64, bits=4)
+    qemb.update(
+        {
+            "scales": qemb.scales.astype(mx.float16),
+            "biases": qemb.biases.astype(mx.float16),
+        }
+    )
+    wrapper = _SingleLeaf(qemb)
+
+    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+
+    assert qemb.scales.dtype == mx.float16
+    assert qemb.biases.dtype == mx.float16
+    # No regular ``bias`` on QuantizedEmbedding; nothing to cast.
+    assert n_cast == 0
+
+
+class _DuckTypedQuantized(nn.Module):
+    """Synthetic stand-in for mlx_lm peers (``QuantizedSwitchLinear`` for
+    MoE, ``QuantizedMultiLinear`` for MLA) that follow the MLX quantize
+    protocol but are not subclasses of ``nn.QuantizedLinear``. The unit
+    test relies on attribute-based detection rather than importing
+    those classes directly so a future mlx_lm version bump does not
+    invalidate the regression coverage.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bits = 4
+        self.group_size = 128
+        self.weight = mx.zeros((4, 128 // 8), dtype=mx.uint32)
+        self.scales = mx.zeros((4, 1), dtype=mx.float16)
+        self.biases = mx.zeros((4, 1), dtype=mx.float16)
+        self.bias = mx.zeros((4,), dtype=mx.float16)
+
+
+def test_align_dtypes_treats_duck_typed_protocol_module_as_quantized():
+    """Any leaf adhering to MLX's quantize protocol — ``bits`` /
+    ``group_size`` set on the instance — must have its ``scales`` /
+    ``biases`` exempted from alignment, regardless of class identity.
+    Covers ``QuantizedSwitchLinear`` (MoE AWQ) and ``QuantizedMultiLinear``
+    (MLA AWQ) without taking an mlx_lm import dependency.
+    """
+    fake = _DuckTypedQuantized()
+    wrapper = _SingleLeaf(fake)
+
+    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+
+    # AWQ-transform buffers stay at the transform's dtype.
+    assert fake.scales.dtype == mx.float16
+    assert fake.biases.dtype == mx.float16
+    # The regular per-expert / per-head bias still aligns.
+    assert fake.bias.dtype == mx.bfloat16
+    assert n_cast == 1
+
+
+@pytest.mark.parametrize(
+    "make_module",
+    [
+        lambda: _make_quantized_linear(bias=True),
+        _DuckTypedQuantized,
+    ],
+    ids=["nn.QuantizedLinear", "duck-typed-protocol-module"],
+)
+def test_align_dtypes_distinguishes_biases_buffer_from_regular_bias(make_module):
+    """``biases`` (plural — the AWQ-transform per-group quant buffer) and
+    ``bias`` (singular — the layer's regular linear bias) coexist on
+    every quantized layer with ``bias=True`` and must follow OPPOSITE
+    dtype policies: ``biases`` stays at the transform's fp16 while
+    ``bias`` aligns to the runtime bf16.
+
+    The two parameter names differ by a single trailing character — a
+    refactor that special-cases by substring (``"bias" in name`` etc.)
+    or that drops one of the two from the exempt set would silently
+    swap the policies. This test pins the distinction on a real
+    ``nn.QuantizedLinear`` and on a duck-typed protocol module standing
+    in for mlx_lm's MoE / MLA peers.
+    """
+    module = make_module()
+    wrapper = _SingleLeaf(module)
+
+    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+
+    assert module.biases.dtype == mx.float16, (
+        "AWQ-transform `biases` (plural) must NOT be cast away from fp16"
+    )
+    assert module.bias.dtype == mx.bfloat16, (
+        "Regular linear `bias` (singular) MUST be cast to runtime bfloat16"
+    )
+    assert n_cast == 1
