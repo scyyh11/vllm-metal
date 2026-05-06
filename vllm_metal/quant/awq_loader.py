@@ -169,7 +169,7 @@ class AWQQuantLoader:
                 return None
         else:
             config_path = Path(hf_hub_download(model_name, "config.json"))
-        with open(config_path) as fid:
+        with open(config_path, encoding="utf-8") as fid:
             config = json.load(fid)
         qc = config.get("quantization_config")
         if isinstance(qc, dict):

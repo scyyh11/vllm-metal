@@ -32,6 +32,7 @@ from huggingface_hub.utils import HFValidationError
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_config import UnsupportedQuantizationConfigError
 from vllm_metal.quant.awq_loader import AWQQuantLoader
+from vllm_metal.v1.model_lifecycle import _generation_cache_key
 
 
 def _mlx_dtype(torch_dtype):
@@ -91,8 +92,6 @@ class TestCacheKey:
         for the same model: an AWQ-mutated cached model must not be
         served to a non-AWQ caller, nor vice versa.
         """
-        from vllm_metal.v1.model_lifecycle import _generation_cache_key
-
         awq_key = AWQQuantLoader.cache_key("x", target_dtype=_mlx_dtype(torch.bfloat16))
         generic_key = _generation_cache_key("x", is_vlm=False)
         assert awq_key != generic_key
