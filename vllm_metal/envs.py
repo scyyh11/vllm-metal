@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     VLLM_METAL_PREFIX_CACHE_FRACTION: str = ""
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_DECODE: bool = True
+    VLLM_METAL_MLA_KERNEL: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
@@ -77,6 +78,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_GDN_LAZY_DECODE": lambda: (
         os.getenv("VLLM_METAL_GDN_LAZY_DECODE", "1") == "1"
     ),
+    # Experimental MLA Metal decode kernel. Off by default — the wrapper
+    # uses MLX SDPA unless this opt-in is set. Enable to route eligible
+    # absorbed-MLA decode through the Metal kernel set (single-pass /
+    # FA wide / 2pass / pr_mma, picked per cell by ``_kernel_fast_path``).
+    # Keep benchmark summaries in PR / release notes rather than tracked
+    # result files.
+    "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
 }
 
 
