@@ -113,6 +113,33 @@ static std::string dtype_to_metal(Dtype dt) {
   }
 }
 
+// MLA dispatchers pick a single Metal specialization from one tensor's
+// dtype (q_nope) but the kernel template binds the same `T` to every
+// fp16/bf16 buffer (q_nope, q_pe, latent_cache, out, tmp_out). If they
+// disagree the shader will reinterpret bytes — e.g. read a bf16 cache
+// as fp16 — and silently corrupt attention. Validate up front.
+static void mla_validate_t_dtypes(
+    const char* dispatcher_name,
+    std::initializer_list<std::pair<const char*, const array*>> tensors) {
+  if (tensors.size() == 0) return;
+  Dtype expected = tensors.begin()->second->dtype();
+  if (expected != float16 && expected != bfloat16) {
+    throw std::runtime_error(
+        std::string(dispatcher_name) +
+        ": T buffers must be fp16 or bf16; got " +
+        dtype_to_metal(expected) + " on " + tensors.begin()->first);
+  }
+  for (const auto& [name, arr] : tensors) {
+    if (arr->dtype() != expected) {
+      throw std::runtime_error(
+          std::string(dispatcher_name) +
+          ": all T buffers must share the same dtype; got " +
+          dtype_to_metal(expected) + " on " + tensors.begin()->first +
+          " but " + dtype_to_metal(arr->dtype()) + " on " + name);
+    }
+  }
+}
+
 static int get_bits(const std::string& quant_type) {
   static const std::unordered_map<std::string, int> BITS = {
       {"q8_0", 8}, {"int8", 8}, {"uint8", 8},
@@ -1036,6 +1063,1747 @@ void init_gdn_library(const std::string& src) {
   d.get_library("gdn_kern", [&]() { return gdn_source_; });
 }
 
+// ---------------------------------------------------------------------------
+// MLA paged attention (RFC #360)
+// ---------------------------------------------------------------------------
+
+static std::string mla_source_;
+
+void init_mla_library(const std::string& src) {
+  mla_source_ = src;
+  auto& d = metal::device(Device::gpu);
+  d.get_library("paged_mla_kern", [&]() { return mla_source_; });
+}
+
+// Dispatch the MLA paged attention kernel.
+//
+// Buffer slot map (must match kernels_v2/mla.metal):
+//   2: out          [total_q_tokens, num_heads, KV_LORA_RANK]
+//   3: q_nope       [total_q_tokens, num_heads, KV_LORA_RANK]
+//   4: q_pe         [total_q_tokens, num_heads, QK_ROPE_HEAD_DIM]
+//   5: latent_cache [num_blocks, BLOCK_SIZE, KV_LORA_RANK + QK_ROPE_HEAD_DIM]
+//   6: block_tables 7: context_lens 8: cu_seqlens_q
+//   9: num_seqs 10: max_num_blocks_per_seq 11: scale
+// Map heads_per_tg → NUM_THREADS. Each variant keeps the per-thread register
+// footprint roughly constant (NUM_THREADS scaled inversely to G).
+//   G=1 → NUM_THREADS=1024 (32 simdgroups, current sdpa_vector layout).
+//   G=4 → NUM_THREADS=256  (8  simdgroups, 4× cross-head amortization).
+// Returns 0 for an unsupported G so callers can validate.
+static int mla_num_threads_for_g(int heads_per_tg) {
+  switch (heads_per_tg) {
+    case 1: return 1024;
+    case 2: return 512;
+    case 4: return 256;
+    default: return 0;
+  }
+}
+
+static void dispatch_mla_paged_attention(
+    array& out,
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    const array& cu_seqlens_q,
+    int block_size,
+    float scale,
+    int heads_per_tg,
+    Stream s,
+    bool from_primitive = false) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(q_nope.shape(0));
+  int num_heads = static_cast<int>(q_nope.shape(1));
+  int kv_lora_rank = static_cast<int>(q_nope.shape(2));
+  int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
+  int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+  int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+
+  // Shape sanity — these must match what the kernel template was instantiated for.
+  if (kv_lora_rank != 512) {
+    throw std::runtime_error(
+        "MLA kernel: only kv_lora_rank=512 is instantiated; got " +
+        std::to_string(kv_lora_rank));
+  }
+  if (qk_rope_head_dim != 64) {
+    throw std::runtime_error(
+        "MLA kernel: only qk_rope_head_dim=64 is instantiated; got " +
+        std::to_string(qk_rope_head_dim));
+  }
+  if (block_size != 16 && block_size != 32) {
+    throw std::runtime_error(
+        "MLA kernel: only block_size in {16, 32} is instantiated; got " +
+        std::to_string(block_size));
+  }
+  int num_threads = mla_num_threads_for_g(heads_per_tg);
+  if (num_threads == 0) {
+    throw std::runtime_error(
+        "MLA kernel: heads_per_tg must be in {1, 2, 4}; got " +
+        std::to_string(heads_per_tg));
+  }
+  if (num_heads % heads_per_tg != 0) {
+    throw std::runtime_error(
+        "MLA kernel: num_heads (" + std::to_string(num_heads) +
+        ") must be divisible by heads_per_tg (" +
+        std::to_string(heads_per_tg) + ")");
+  }
+  mla_validate_t_dtypes("MLA kernel", {
+      {"q_nope", &q_nope},
+      {"q_pe", &q_pe},
+      {"latent_cache", &latent_cache},
+      {"out", &out},
+  });
+
+  auto dt = dtype_to_metal(q_nope.dtype());
+  std::string kname = "paged_mla_attention_" + dt + "_kvr" +
+                      std::to_string(kv_lora_rank) + "_pe" +
+                      std::to_string(qk_rope_head_dim) + "_bs" +
+                      std::to_string(block_size) + "_g" +
+                      std::to_string(heads_per_tg) + "_nt" +
+                      std::to_string(num_threads) + "_nsl32_ps0";
+
+  bool use_partitioning = false;
+  bool use_alibi = false;
+  bool use_fp8_scales = false;
+  bool use_sinks = false;
+  bool use_turboquant = false;
+
+  std::string hash_name = kname + "_part" + (use_partitioning ? "1" : "0") +
+                          "_alibi0_fp80_sinks0_tq0";
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(
+      kname,
+      lib,
+      hash_name,
+      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
+       {&use_alibi, MTL::DataType::DataTypeBool, NS::UInteger(20)},
+       {&use_fp8_scales, MTL::DataType::DataTypeBool, NS::UInteger(30)},
+       {&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&use_turboquant, MTL::DataType::DataTypeBool, NS::UInteger(50)}});
+
+  // Threadgroup memory:
+  //   max_scores[G * BN] + sum_exp_scores[G * BN] + outputs[BD * BD]
+  // The outputs buffer must be sized for the maximum write offset
+  // `lane*BD + sg`, which reaches (BD-1)*BD + (BN-1). Using BD*BD always
+  // (rather than BN*BD) gives enough room across all G; on G=1 (BN=BD=32)
+  // they coincide.
+  // For G=1, NT=1024: 2*32 + 32*32 = 1088 fp32 ≈ 4.3 KB.
+  // For G=4, NT=256:  2*4*8 + 32*32 = 1088 fp32 ≈ 4.3 KB.
+  const int BD = 32;
+  const int BN = num_threads / BD;
+  size_t shmem =
+      static_cast<size_t>((2 * heads_per_tg * BN + BD * BD) * sizeof(float));
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_threadgroup_memory_length(shmem, 0);
+
+  enc.set_output_array(out, 2);
+  enc.set_input_array(q_nope, 3);
+  enc.set_input_array(q_pe, 4);
+  enc.set_input_array(latent_cache, 5);
+  enc.set_input_array(block_tables, 6);
+  enc.set_input_array(context_lens, 7);
+  enc.set_input_array(cu_seqlens_q, 8);
+
+  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  enc.set_bytes(num_seqs_i, 9);
+  enc.set_bytes(max_blocks_i, 10);
+  enc.set_bytes(scale, 11);
+
+  // Grid: (num_heads / G, total_q_tokens, 1). Each TG owns G consecutive
+  // query heads sharing the same latent KV.
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens, 1),
+      MTL::Size::Make(num_threads, 1, 1));
+
+  // See dispatch_reshape_and_cache: inside a primitive, MLX manages array
+  // lifetimes via the completion handler; add_temporary would defeat
+  // fence-based sync across the command buffer boundary.
+  if (!from_primitive) {
+    add_temporary_compat(enc, out, d, s);
+    add_temporary_compat(enc, q_nope, d, s);
+    add_temporary_compat(enc, q_pe, d, s);
+    add_temporary_compat(enc, latent_cache, d, s);
+    add_temporary_compat(enc, block_tables, d, s);
+    add_temporary_compat(enc, context_lens, d, s);
+    add_temporary_compat(enc, cu_seqlens_q, d, s);
+  }
+}
+
+// MLA single-pass paged attention as a proper MLX Primitive so that the
+// kernel dispatch joins the wrapper's lazy graph instead of forcing a
+// mx.eval boundary inside the Python entry. The eager
+// ``mla_paged_attention`` binding is kept for backward-compat callers
+// (bench tools, tests); ``_kernel_fast_path`` switches to the
+// primitive variant.
+//
+// Why this matters: at B=1 H=16 ctx=128 the kernel itself is ~170 μs
+// but the wrapper end-to-end is ~700 μs — the gap is ~3-4 per-call
+// MLX dispatch boundaries (each ~200 μs at this small workload). The
+// kernel-entry mx.eval (which materialises q_nope, q_pe, etc. before
+// our in-place dispatch) is one of those boundaries. As a Primitive
+// the kernel call lives in the lazy graph; MLX evaluates everything
+// at the wrapper's terminal mx.eval and the per-dispatch overhead
+// folds into the wrapper's existing sync.
+class MlaPagedAttentionPrimitive : public UnaryPrimitive {
+ public:
+  MlaPagedAttentionPrimitive(
+      Stream stream, int block_size, float scale, int heads_per_tg)
+      : UnaryPrimitive(stream),
+        block_size_(block_size),
+        scale_(scale),
+        heads_per_tg_(heads_per_tg) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error("MlaPagedAttentionPrimitive only supports GPU");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    // Inputs match the single-pass dispatcher's positional order:
+    //   [q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q]
+    out.set_data(allocator::malloc(out.nbytes()));
+    dispatch_mla_paged_attention(
+        out,
+        inputs[0], inputs[1], inputs[2],
+        inputs[3], inputs[4], inputs[5],
+        block_size_, scale_, heads_per_tg_,
+        stream(),
+        /*from_primitive=*/true);
+  }
+
+  const char* name() const override { return "MlaPagedAttention"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    auto* rhs = dynamic_cast<const MlaPagedAttentionPrimitive*>(&other);
+    return rhs && rhs->block_size_ == block_size_
+        && rhs->scale_ == scale_ && rhs->heads_per_tg_ == heads_per_tg_;
+  }
+
+ private:
+  int block_size_;
+  float scale_;
+  int heads_per_tg_;
+};
+
+static array mla_paged_attention_primitive_fn(
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    const array& cu_seqlens_q,
+    int block_size,
+    float scale,
+    int heads_per_tg) {
+  auto prim = std::make_shared<MlaPagedAttentionPrimitive>(
+      default_stream(Device::gpu), block_size, scale, heads_per_tg);
+  // Output shape matches q_nope: (total_q_tokens, num_heads, kv_lora_rank).
+  return array(
+      q_nope.shape(),
+      q_nope.dtype(),
+      std::move(prim),
+      {q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q});
+}
+
+void mla_paged_attention_impl(
+    nb::handle out_h,
+    nb::handle q_nope_h,
+    nb::handle q_pe_h,
+    nb::handle latent_cache_h,
+    nb::handle block_tables_h,
+    nb::handle context_lens_h,
+    nb::handle cu_seqlens_q_h,
+    int block_size,
+    float scale,
+    int heads_per_tg) {
+  auto& out = *nb::inst_ptr<array>(out_h);
+  auto& q_nope = *nb::inst_ptr<array>(q_nope_h);
+  auto& q_pe = *nb::inst_ptr<array>(q_pe_h);
+  auto& latent_cache = *nb::inst_ptr<array>(latent_cache_h);
+  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
+  auto& context_lens = *nb::inst_ptr<array>(context_lens_h);
+  auto& cu_seqlens_q = *nb::inst_ptr<array>(cu_seqlens_q_h);
+
+  dispatch_mla_paged_attention(
+      out,
+      q_nope,
+      q_pe,
+      latent_cache,
+      block_tables,
+      context_lens,
+      cu_seqlens_q,
+      block_size,
+      scale,
+      heads_per_tg,
+      default_stream(Device::gpu));
+}
+
+// Partitioned MLA dispatch: split-K main kernel + reduce.
+//
+// Caller pre-allocates exp_sums [num_seqs, num_heads, max_num_partitions]
+// fp32, max_logits same shape, tmp_out [num_seqs, num_heads,
+// max_num_partitions, kv_lora_rank] T (zero-initialized — partitions with no
+// work return early without writing).
+//
+// partition_size must be one of the instantiated values (currently 512).
+static void dispatch_mla_paged_attention_partitioned(
+    array& out,
+    array& exp_sums,
+    array& max_logits,
+    array& tmp_out,
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    const array& cu_seqlens_q,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    int heads_per_tg,
+    Stream s) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(q_nope.shape(0));
+  int num_heads = static_cast<int>(q_nope.shape(1));
+  int kv_lora_rank = static_cast<int>(q_nope.shape(2));
+  int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
+  int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+  int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+
+  // Shape sanity — match the instantiated specializations.
+  if (kv_lora_rank != 512) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: only kv_lora_rank=512 is instantiated; got " +
+        std::to_string(kv_lora_rank));
+  }
+  if (qk_rope_head_dim != 64) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: only qk_rope_head_dim=64 is instantiated; got " +
+        std::to_string(qk_rope_head_dim));
+  }
+  if (block_size != 16 && block_size != 32) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: only block_size in {16, 32} is instantiated; got " +
+        std::to_string(block_size));
+  }
+  if (partition_size != 512) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: only partition_size=512 is instantiated; got " +
+        std::to_string(partition_size));
+  }
+  if (partition_size % block_size != 0) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: partition_size (" +
+        std::to_string(partition_size) + ") must be divisible by block_size (" +
+        std::to_string(block_size) + ").");
+  }
+  int num_threads = mla_num_threads_for_g(heads_per_tg);
+  if (num_threads == 0) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: heads_per_tg must be in {1, 4}; got " +
+        std::to_string(heads_per_tg));
+  }
+  if (num_heads % heads_per_tg != 0) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: num_heads (" + std::to_string(num_heads) +
+        ") must be divisible by heads_per_tg (" +
+        std::to_string(heads_per_tg) + ")");
+  }
+  mla_validate_t_dtypes("MLA partitioned kernel", {
+      {"q_nope", &q_nope},
+      {"q_pe", &q_pe},
+      {"latent_cache", &latent_cache},
+      {"out", &out},
+      {"tmp_out", &tmp_out},
+  });
+
+  auto dt = dtype_to_metal(q_nope.dtype());
+  std::string kname = "paged_mla_attention_" + dt + "_kvr" +
+                      std::to_string(kv_lora_rank) + "_pe" +
+                      std::to_string(qk_rope_head_dim) + "_bs" +
+                      std::to_string(block_size) + "_g" +
+                      std::to_string(heads_per_tg) + "_nt" +
+                      std::to_string(num_threads) + "_nsl32_ps" +
+                      std::to_string(partition_size);
+
+  bool use_partitioning = true;
+  bool use_alibi = false;
+  bool use_fp8_scales = false;
+  bool use_sinks = false;
+  bool use_turboquant = false;
+
+  std::string hash_name = kname + "_part" + (use_partitioning ? "1" : "0") +
+                          "_alibi0_fp80_sinks0_tq0";
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(
+      kname,
+      lib,
+      hash_name,
+      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
+       {&use_alibi, MTL::DataType::DataTypeBool, NS::UInteger(20)},
+       {&use_fp8_scales, MTL::DataType::DataTypeBool, NS::UInteger(30)},
+       {&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&use_turboquant, MTL::DataType::DataTypeBool, NS::UInteger(50)}});
+
+  // Threadgroup memory: same layout as non-partitioned dispatch
+  // (see that comment block for sizing rationale).
+  const int BD_part = 32;
+  const int BN_part = num_threads / BD_part;
+  size_t shmem = static_cast<size_t>(
+      (2 * heads_per_tg * BN_part + BD_part * BD_part) * sizeof(float));
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_threadgroup_memory_length(shmem, 0);
+
+  // Buffer slots match kernels_v2/mla.metal main kernel layout.
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  enc.set_output_array(tmp_out, 2);
+  enc.set_input_array(q_nope, 3);
+  enc.set_input_array(q_pe, 4);
+  enc.set_input_array(latent_cache, 5);
+  enc.set_input_array(block_tables, 6);
+  enc.set_input_array(context_lens, 7);
+  enc.set_input_array(cu_seqlens_q, 8);
+
+  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  enc.set_bytes(num_seqs_i, 9);
+  enc.set_bytes(max_blocks_i, 10);
+  enc.set_bytes(scale, 11);
+
+  // Grid: (num_heads / G, total_q_tokens, max_num_partitions). Empty
+  // partitions return early in the kernel body.
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens,
+                      max_num_partitions),
+      MTL::Size::Make(num_threads, 1, 1));
+
+  // Reduce kernel: merges per-partition (max, lse, partial out) into final out.
+  // Reduce work is small (one merge per (head, query) over max_num_partitions
+  // floats + max_num_partitions × HEAD_SIZE values), so 256 threads is enough.
+  // The reduce kernel template is instantiated at NUM_THREADS=256 — keep this
+  // constant in sync with `instantiate_mla_reduce` in mla.metal.
+  constexpr int REDUCE_NUM_THREADS = 256;
+  constexpr int REDUCE_NUM_WARPS = REDUCE_NUM_THREADS / 32;
+  std::string reduce_kname = "paged_mla_attention_reduce_" + dt + "_hs" +
+                             std::to_string(kv_lora_rank) + "_nt256_nsl32_ps" +
+                             std::to_string(partition_size);
+  auto* reduce_kernel = d.get_kernel(reduce_kname, lib, reduce_kname, {});
+
+  size_t reduce_shmem = static_cast<size_t>(
+      (2 * max_num_partitions + 2 * REDUCE_NUM_WARPS) * sizeof(float));
+
+  enc.set_compute_pipeline_state(reduce_kernel);
+  enc.set_threadgroup_memory_length(reduce_shmem, 0);
+
+  enc.set_output_array(out, 0);
+  enc.set_input_array(exp_sums, 1);
+  enc.set_input_array(max_logits, 2);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(context_lens, 4);
+  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+  enc.set_bytes(max_num_partitions_i, 5);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(REDUCE_NUM_THREADS, 1, 1));
+
+  add_temporary_compat(enc, out, d, s);
+  add_temporary_compat(enc, exp_sums, d, s);
+  add_temporary_compat(enc, max_logits, d, s);
+  add_temporary_compat(enc, tmp_out, d, s);
+  add_temporary_compat(enc, q_nope, d, s);
+  add_temporary_compat(enc, q_pe, d, s);
+  add_temporary_compat(enc, latent_cache, d, s);
+  add_temporary_compat(enc, block_tables, d, s);
+  add_temporary_compat(enc, context_lens, d, s);
+  add_temporary_compat(enc, cu_seqlens_q, d, s);
+}
+
+void mla_paged_attention_partitioned_impl(
+    nb::handle out_h,
+    nb::handle exp_sums_h,
+    nb::handle max_logits_h,
+    nb::handle tmp_out_h,
+    nb::handle q_nope_h,
+    nb::handle q_pe_h,
+    nb::handle latent_cache_h,
+    nb::handle block_tables_h,
+    nb::handle context_lens_h,
+    nb::handle cu_seqlens_q_h,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    int heads_per_tg) {
+  auto& out = *nb::inst_ptr<array>(out_h);
+  auto& exp_sums = *nb::inst_ptr<array>(exp_sums_h);
+  auto& max_logits = *nb::inst_ptr<array>(max_logits_h);
+  auto& tmp_out = *nb::inst_ptr<array>(tmp_out_h);
+  auto& q_nope = *nb::inst_ptr<array>(q_nope_h);
+  auto& q_pe = *nb::inst_ptr<array>(q_pe_h);
+  auto& latent_cache = *nb::inst_ptr<array>(latent_cache_h);
+  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
+  auto& context_lens = *nb::inst_ptr<array>(context_lens_h);
+  auto& cu_seqlens_q = *nb::inst_ptr<array>(cu_seqlens_q_h);
+
+  dispatch_mla_paged_attention_partitioned(
+      out,
+      exp_sums,
+      max_logits,
+      tmp_out,
+      q_nope,
+      q_pe,
+      latent_cache,
+      block_tables,
+      context_lens,
+      cu_seqlens_q,
+      block_size,
+      scale,
+      partition_size,
+      max_num_partitions,
+      heads_per_tg,
+      default_stream(Device::gpu));
+}
+
+// Decode 2pass dispatch — MLX sdpa_vector_2pass-style cross-head amortization.
+//
+// Threadgroup layout: (32, num_heads, 1). One simdgroup per query head; ALL
+// heads share each K-cache token read so total KV bandwidth is amortized
+// `num_heads`× across the TG. Splits the ctx dim across `num_partitions`
+// TGs per (seq), then reduces partials with the existing reduce kernel.
+//
+// Caller pre-allocates exp_sums [num_seqs, num_heads, max_num_partitions]
+// fp32, max_logits same shape, tmp_out [num_seqs, num_heads,
+// max_num_partitions, kv_lora_rank] T (zero-initialized).
+//
+// partition_size must be one of the instantiated values (64, 128, 256, 512).
+static void dispatch_mla_paged_attention_decode_2pass(
+    array& out,
+    array& exp_sums,
+    array& max_logits,
+    array& tmp_out,
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    Stream s,
+    bool from_primitive = false) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(q_nope.shape(0));
+  int num_heads = static_cast<int>(q_nope.shape(1));
+  int kv_lora_rank = static_cast<int>(q_nope.shape(2));
+  int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
+  int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+
+  if (kv_lora_rank != 512) {
+    throw std::runtime_error(
+        "MLA 2pass kernel: only kv_lora_rank=512 is instantiated; got " +
+        std::to_string(kv_lora_rank));
+  }
+  if (qk_rope_head_dim != 64) {
+    throw std::runtime_error(
+        "MLA 2pass kernel: only qk_rope_head_dim=64 is instantiated; got " +
+        std::to_string(qk_rope_head_dim));
+  }
+  if (block_size != 16 && block_size != 32) {
+    throw std::runtime_error(
+        "MLA 2pass kernel: only block_size in {16, 32} is instantiated; got " +
+        std::to_string(block_size));
+  }
+  if (partition_size != 64 && partition_size != 128 &&
+      partition_size != 256 && partition_size != 512) {
+    throw std::runtime_error(
+        "MLA 2pass kernel: only partition_size in {64, 128, 256, 512} is "
+        "instantiated; got " +
+        std::to_string(partition_size));
+  }
+  if (partition_size % block_size != 0) {
+    throw std::runtime_error(
+        "MLA 2pass kernel: partition_size (" +
+        std::to_string(partition_size) + ") must be divisible by block_size (" +
+        std::to_string(block_size) + ").");
+  }
+  mla_validate_t_dtypes("MLA 2pass kernel", {
+      {"q_nope", &q_nope},
+      {"q_pe", &q_pe},
+      {"latent_cache", &latent_cache},
+      {"out", &out},
+      {"tmp_out", &tmp_out},
+  });
+
+  // HEADS_PER_TG=8 is the portable default. The 2pass main kernel's
+  // per-thread register footprint (q_nope_local[16] + q_pe_local[2] +
+  // v_local[16 fp32] + transient k_norm_local) can push the PSO's
+  // maxTotalThreadsPerThreadgroup below 1024 on Apple Silicon variants
+  // with smaller per-core register files than M5 Max (observed on the
+  // macos-15 GitHub Actions runners). When that happens, dispatching
+  // (32 lanes × 32 heads = 1024 threads/TG) silently fails and tmp_out
+  // stays at its zero-init value — surfacing as ~max-magnitude diffs
+  // against the dense reference. HPT=8 (32 × 8 = 256 threads/TG) is
+  // well within the PSO cap on every Apple chip we have evidence for.
+  //
+  // Follow-up: a runtime PSO::maxTotalThreadsPerThreadgroup query can
+  // re-enable HPT=32 on hardware that supports it (M5 Max recovers the
+  // cross-head K amortization win). Keeping the picker fixed for now
+  // to minimize the change surface for the CI green-up.
+  int heads_per_tg = 8;
+  int num_head_groups = (num_heads + heads_per_tg - 1) / heads_per_tg;
+
+  auto dt = dtype_to_metal(q_nope.dtype());
+  std::string kname = "paged_mla_attention_decode_2pass_1_" + dt + "_kvr" +
+                      std::to_string(kv_lora_rank) + "_pe" +
+                      std::to_string(qk_rope_head_dim) + "_bs" +
+                      std::to_string(block_size) + "_ps" +
+                      std::to_string(partition_size) + "_hpt" +
+                      std::to_string(heads_per_tg);
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  enc.set_output_array(tmp_out, 2);
+  enc.set_input_array(q_nope, 3);
+  enc.set_input_array(q_pe, 4);
+  enc.set_input_array(latent_cache, 5);
+  enc.set_input_array(block_tables, 6);
+  enc.set_input_array(context_lens, 7);
+
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  int32_t num_heads_i = static_cast<int32_t>(num_heads);
+  enc.set_bytes(max_blocks_i, 8);
+  enc.set_bytes(num_heads_i, 9);
+  enc.set_bytes(scale, 10);
+
+  // Grid: (num_seqs, num_partitions, num_head_groups).
+  // TG:   (32, heads_per_tg, 1) — capped at 1024 threads/TG. For
+  // num_heads > 32 the head dim spans grid.z; cross-head-group
+  // amortization happens via L2 cache hits (different head-groups for the
+  // same (seq, partition) read identical K addresses).
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(total_q_tokens, max_num_partitions, num_head_groups),
+      MTL::Size::Make(32, heads_per_tg, 1));
+
+  // Reduce kernel — same as partitioned dispatch.
+  constexpr int REDUCE_NUM_THREADS = 256;
+  constexpr int REDUCE_NUM_WARPS = REDUCE_NUM_THREADS / 32;
+  std::string reduce_kname = "paged_mla_attention_reduce_" + dt + "_hs" +
+                             std::to_string(kv_lora_rank) + "_nt256_nsl32_ps" +
+                             std::to_string(partition_size);
+  auto* reduce_kernel = d.get_kernel(reduce_kname, lib, reduce_kname, {});
+
+  size_t reduce_shmem = static_cast<size_t>(
+      (2 * max_num_partitions + 2 * REDUCE_NUM_WARPS) * sizeof(float));
+
+  enc.set_compute_pipeline_state(reduce_kernel);
+  enc.set_threadgroup_memory_length(reduce_shmem, 0);
+
+  enc.set_output_array(out, 0);
+  enc.set_input_array(exp_sums, 1);
+  enc.set_input_array(max_logits, 2);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(context_lens, 4);
+  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+  enc.set_bytes(max_num_partitions_i, 5);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(REDUCE_NUM_THREADS, 1, 1));
+
+  // Scratch (exp_sums / max_logits / tmp_out) is always tracked: in
+  // primitive mode it's stack-local to eval_gpu (encoder must keep
+  // buffers alive past frame exit); in eager mode it's Python-owned
+  // but still needs encoder lifetime extension.
+  add_temporary_compat(enc, exp_sums, d, s);
+  add_temporary_compat(enc, max_logits, d, s);
+  add_temporary_compat(enc, tmp_out, d, s);
+  if (!from_primitive) {
+    add_temporary_compat(enc, out, d, s);
+    add_temporary_compat(enc, q_nope, d, s);
+    add_temporary_compat(enc, q_pe, d, s);
+    add_temporary_compat(enc, latent_cache, d, s);
+    add_temporary_compat(enc, block_tables, d, s);
+    add_temporary_compat(enc, context_lens, d, s);
+  }
+}
+
+// Bench-only. Splits the 2pass dispatch into separate
+// main-only and reduce-only encoders so the bench harness can place
+// an ``mx.synchronize()`` between them and time each kernel in
+// isolation. NOT on any production path — the eager and primitive
+// 2pass entries still issue both kernels on one encoder.
+//
+// All validation mirrors ``dispatch_mla_paged_attention_decode_2pass``
+// since the kernels are the same; we duplicate to keep this strictly
+// additive without touching the production dispatcher.
+static void dispatch_mla_paged_attention_decode_2pass_main_only(
+    array& exp_sums,
+    array& max_logits,
+    array& tmp_out,
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    Stream s) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(q_nope.shape(0));
+  int num_heads = static_cast<int>(q_nope.shape(1));
+  int kv_lora_rank = static_cast<int>(q_nope.shape(2));
+  int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
+  int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+
+  if (kv_lora_rank != 512) {
+    throw std::runtime_error(
+        "MLA 2pass kernel (main-only): only kv_lora_rank=512 is "
+        "instantiated; got " +
+        std::to_string(kv_lora_rank));
+  }
+  if (qk_rope_head_dim != 64) {
+    throw std::runtime_error(
+        "MLA 2pass kernel (main-only): only qk_rope_head_dim=64 is "
+        "instantiated; got " +
+        std::to_string(qk_rope_head_dim));
+  }
+  if (block_size != 16 && block_size != 32) {
+    throw std::runtime_error(
+        "MLA 2pass kernel (main-only): only block_size in {16, 32} is "
+        "instantiated; got " +
+        std::to_string(block_size));
+  }
+  if (partition_size != 64 && partition_size != 128 &&
+      partition_size != 256 && partition_size != 512) {
+    throw std::runtime_error(
+        "MLA 2pass kernel (main-only): only partition_size in {64, 128, "
+        "256, 512} is instantiated; got " +
+        std::to_string(partition_size));
+  }
+  mla_validate_t_dtypes("MLA 2pass kernel (main-only)", {
+      {"q_nope", &q_nope},
+      {"q_pe", &q_pe},
+      {"latent_cache", &latent_cache},
+      {"tmp_out", &tmp_out},
+  });
+
+  // Same portable HPT=8 policy as the combined dispatch — see the
+  // comment there for the maxTotalThreadsPerThreadgroup rationale.
+  int heads_per_tg = 8;
+  int num_head_groups = (num_heads + heads_per_tg - 1) / heads_per_tg;
+
+  auto dt = dtype_to_metal(q_nope.dtype());
+  std::string kname = "paged_mla_attention_decode_2pass_1_" + dt + "_kvr" +
+                      std::to_string(kv_lora_rank) + "_pe" +
+                      std::to_string(qk_rope_head_dim) + "_bs" +
+                      std::to_string(block_size) + "_ps" +
+                      std::to_string(partition_size) + "_hpt" +
+                      std::to_string(heads_per_tg);
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  enc.set_output_array(tmp_out, 2);
+  enc.set_input_array(q_nope, 3);
+  enc.set_input_array(q_pe, 4);
+  enc.set_input_array(latent_cache, 5);
+  enc.set_input_array(block_tables, 6);
+  enc.set_input_array(context_lens, 7);
+
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  int32_t num_heads_i = static_cast<int32_t>(num_heads);
+  enc.set_bytes(max_blocks_i, 8);
+  enc.set_bytes(num_heads_i, 9);
+  enc.set_bytes(scale, 10);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(total_q_tokens, max_num_partitions, num_head_groups),
+      MTL::Size::Make(32, heads_per_tg, 1));
+
+  add_temporary_compat(enc, exp_sums, d, s);
+  add_temporary_compat(enc, max_logits, d, s);
+  add_temporary_compat(enc, tmp_out, d, s);
+  add_temporary_compat(enc, q_nope, d, s);
+  add_temporary_compat(enc, q_pe, d, s);
+  add_temporary_compat(enc, latent_cache, d, s);
+  add_temporary_compat(enc, block_tables, d, s);
+  add_temporary_compat(enc, context_lens, d, s);
+}
+
+static void dispatch_mla_paged_attention_decode_2pass_reduce_only(
+    array& out,
+    const array& exp_sums,
+    const array& max_logits,
+    const array& tmp_out,
+    const array& context_lens,
+    int partition_size,
+    int max_num_partitions,
+    Stream s) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(out.shape(0));
+  int num_heads = static_cast<int>(out.shape(1));
+  int kv_lora_rank = static_cast<int>(out.shape(2));
+
+  if (kv_lora_rank != 512) {
+    throw std::runtime_error(
+        "MLA 2pass kernel (reduce-only): only kv_lora_rank=512 is "
+        "instantiated; got " +
+        std::to_string(kv_lora_rank));
+  }
+  if (partition_size != 64 && partition_size != 128 &&
+      partition_size != 256 && partition_size != 512) {
+    throw std::runtime_error(
+        "MLA 2pass kernel (reduce-only): only partition_size in {64, 128, "
+        "256, 512} is instantiated; got " +
+        std::to_string(partition_size));
+  }
+  mla_validate_t_dtypes("MLA 2pass kernel (reduce-only)", {
+      {"out", &out},
+      {"tmp_out", &tmp_out},
+  });
+
+  auto dt = dtype_to_metal(out.dtype());
+  constexpr int REDUCE_NUM_THREADS = 256;
+  constexpr int REDUCE_NUM_WARPS = REDUCE_NUM_THREADS / 32;
+  std::string reduce_kname = "paged_mla_attention_reduce_" + dt + "_hs" +
+                             std::to_string(kv_lora_rank) + "_nt256_nsl32_ps" +
+                             std::to_string(partition_size);
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* reduce_kernel = d.get_kernel(reduce_kname, lib, reduce_kname, {});
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(reduce_kernel);
+
+  size_t reduce_shmem = static_cast<size_t>(
+      (2 * max_num_partitions + 2 * REDUCE_NUM_WARPS) * sizeof(float));
+  enc.set_threadgroup_memory_length(reduce_shmem, 0);
+
+  enc.set_output_array(out, 0);
+  enc.set_input_array(exp_sums, 1);
+  enc.set_input_array(max_logits, 2);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(context_lens, 4);
+  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+  enc.set_bytes(max_num_partitions_i, 5);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(REDUCE_NUM_THREADS, 1, 1));
+
+  add_temporary_compat(enc, out, d, s);
+  add_temporary_compat(enc, exp_sums, d, s);
+  add_temporary_compat(enc, max_logits, d, s);
+  add_temporary_compat(enc, tmp_out, d, s);
+  add_temporary_compat(enc, context_lens, d, s);
+}
+
+// Per-request MMA paged main dispatcher. Same scratch contract as
+// 2pass main so the existing reduce kernel applies.
+static void dispatch_mla_paged_attention_decode_pr_mma_main(
+    array& exp_sums,
+    array& max_logits,
+    array& tmp_out,
+    const array& q_combined,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    Stream s) {
+  auto& d = metal::device(s.device);
+
+  const int num_seqs = static_cast<int>(q_combined.shape(0));
+  const int num_heads = static_cast<int>(q_combined.shape(1));
+  const int d_combined = static_cast<int>(q_combined.shape(2));
+  const int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+
+  constexpr int KV_LORA_RANK = 512;
+  constexpr int QK_ROPE_HEAD_DIM = 64;
+  constexpr int EXPECTED_D = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+  if (d_combined != EXPECTED_D) {
+    throw std::runtime_error(
+        "MLA pr_mma_main: only D=576 (KVR=512+PE=64) instantiated; got " +
+        std::to_string(d_combined));
+  }
+  if (block_size != 16 && block_size != 32) {
+    throw std::runtime_error(
+        "MLA pr_mma_main: only block_size ∈ {16, 32} instantiated; got " +
+        std::to_string(block_size));
+  }
+  if (partition_size != 128) {
+    throw std::runtime_error(
+        "MLA pr_mma_main: only partition_size=128 instantiated; got " +
+        std::to_string(partition_size));
+  }
+  if (q_combined.dtype() != float16 && q_combined.dtype() != bfloat16) {
+    throw std::runtime_error(
+        "MLA pr_mma_main: only fp16 / bf16 instantiated.");
+  }
+  mla_validate_t_dtypes("MLA pr_mma_main", {
+      {"q_combined", &q_combined},
+      {"latent_cache", &latent_cache},
+      {"tmp_out", &tmp_out},
+  });
+
+  constexpr int HEADS_PER_TG = 32;
+  constexpr int WM = 4;
+  constexpr int WN = 8;
+  const int num_head_groups =
+      (num_heads + HEADS_PER_TG - 1) / HEADS_PER_TG;
+
+  auto dt = dtype_to_metal(q_combined.dtype());
+  std::string kname =
+      "paged_mla_attention_decode_pr_mma_main_" + dt +
+      "_kvr512_pe64_bs" + std::to_string(block_size) +
+      "_ps128_hpt32_wm4_wn8";
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  enc.set_output_array(tmp_out, 2);
+  enc.set_input_array(q_combined, 3);
+  enc.set_input_array(latent_cache, 4);
+  enc.set_input_array(block_tables, 5);
+  enc.set_input_array(context_lens, 6);
+
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  int32_t num_heads_i = static_cast<int32_t>(num_heads);
+  enc.set_bytes(max_blocks_i, 7);
+  enc.set_bytes(num_heads_i, 8);
+  enc.set_bytes(scale, 9);
+
+  // Grid: (num_seqs, max_num_partitions, num_head_groups). TG: 32 × WM*WN.
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_seqs, max_num_partitions, num_head_groups),
+      MTL::Size::Make(32, WM * WN, 1));
+
+  add_temporary_compat(enc, exp_sums, d, s);
+  add_temporary_compat(enc, max_logits, d, s);
+  add_temporary_compat(enc, tmp_out, d, s);
+  add_temporary_compat(enc, q_combined, d, s);
+  add_temporary_compat(enc, latent_cache, d, s);
+  add_temporary_compat(enc, block_tables, d, s);
+  add_temporary_compat(enc, context_lens, d, s);
+}
+
+// Combined main + reduce dispatcher for the per-request MMA path.
+// Mirrors dispatch_mla_paged_attention_decode_2pass: issues the main
+// kernel (pr_mma) and the existing reduce kernel onto a single command
+// encoder. ``from_primitive=true`` skips the per-input
+// add_temporary_compat tracking (the wrapper graph holds the inputs
+// alive); scratch arrays are still tracked since they're allocated
+// inside eval_gpu.
+static void dispatch_mla_paged_attention_decode_pr_mma(
+    array& out,
+    array& exp_sums,
+    array& max_logits,
+    array& tmp_out,
+    const array& q_combined,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    Stream s,
+    bool from_primitive = false) {
+  auto& d = metal::device(s.device);
+  const int total_q_tokens = static_cast<int>(q_combined.shape(0));
+  const int num_heads = static_cast<int>(q_combined.shape(1));
+  const int d_combined = static_cast<int>(q_combined.shape(2));
+  const int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+
+  constexpr int KV_LORA_RANK = 512;
+  constexpr int QK_ROPE_HEAD_DIM = 64;
+  constexpr int EXPECTED_D = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+  if (d_combined != EXPECTED_D) {
+    throw std::runtime_error(
+        "MLA pr_mma combined: only D=576 instantiated; got " +
+        std::to_string(d_combined));
+  }
+  if (block_size != 16 && block_size != 32) {
+    throw std::runtime_error(
+        "MLA pr_mma combined: only block_size ∈ {16, 32} instantiated; got " +
+        std::to_string(block_size));
+  }
+  if (partition_size != 128) {
+    throw std::runtime_error(
+        "MLA pr_mma combined: only partition_size=128 instantiated; got " +
+        std::to_string(partition_size));
+  }
+  if (q_combined.dtype() != float16 && q_combined.dtype() != bfloat16) {
+    throw std::runtime_error(
+        "MLA pr_mma combined: only fp16 / bf16 instantiated.");
+  }
+  mla_validate_t_dtypes("MLA pr_mma combined", {
+      {"q_combined", &q_combined},
+      {"latent_cache", &latent_cache},
+      {"out", &out},
+      {"tmp_out", &tmp_out},
+  });
+
+  constexpr int HEADS_PER_TG = 32;
+  constexpr int WM = 4;
+  constexpr int WN = 8;
+  const int num_head_groups =
+      (num_heads + HEADS_PER_TG - 1) / HEADS_PER_TG;
+
+  auto dt = dtype_to_metal(q_combined.dtype());
+  std::string kname =
+      "paged_mla_attention_decode_pr_mma_main_" + dt +
+      "_kvr512_pe64_bs" + std::to_string(block_size) +
+      "_ps128_hpt32_wm4_wn8";
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  enc.set_output_array(tmp_out, 2);
+  enc.set_input_array(q_combined, 3);
+  enc.set_input_array(latent_cache, 4);
+  enc.set_input_array(block_tables, 5);
+  enc.set_input_array(context_lens, 6);
+
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  int32_t num_heads_i = static_cast<int32_t>(num_heads);
+  enc.set_bytes(max_blocks_i, 7);
+  enc.set_bytes(num_heads_i, 8);
+  enc.set_bytes(scale, 9);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(total_q_tokens, max_num_partitions, num_head_groups),
+      MTL::Size::Make(32, WM * WN, 1));
+
+  // === Reduce kernel: identical to 2pass's reduce — same scratch contract. ===
+  constexpr int REDUCE_NUM_THREADS = 256;
+  constexpr int REDUCE_NUM_WARPS = REDUCE_NUM_THREADS / 32;
+  std::string reduce_kname = "paged_mla_attention_reduce_" + dt + "_hs" +
+                             std::to_string(KV_LORA_RANK) + "_nt256_nsl32_ps" +
+                             std::to_string(partition_size);
+  auto* reduce_kernel = d.get_kernel(reduce_kname, lib, reduce_kname, {});
+
+  size_t reduce_shmem = static_cast<size_t>(
+      (2 * max_num_partitions + 2 * REDUCE_NUM_WARPS) * sizeof(float));
+
+  enc.set_compute_pipeline_state(reduce_kernel);
+  enc.set_threadgroup_memory_length(reduce_shmem, 0);
+
+  enc.set_output_array(out, 0);
+  enc.set_input_array(exp_sums, 1);
+  enc.set_input_array(max_logits, 2);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(context_lens, 4);
+  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+  enc.set_bytes(max_num_partitions_i, 5);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(REDUCE_NUM_THREADS, 1, 1));
+
+  // Scratch always tracked.
+  add_temporary_compat(enc, exp_sums, d, s);
+  add_temporary_compat(enc, max_logits, d, s);
+  add_temporary_compat(enc, tmp_out, d, s);
+  if (!from_primitive) {
+    add_temporary_compat(enc, out, d, s);
+    add_temporary_compat(enc, q_combined, d, s);
+    add_temporary_compat(enc, latent_cache, d, s);
+    add_temporary_compat(enc, block_tables, d, s);
+    add_temporary_compat(enc, context_lens, d, s);
+  }
+}
+
+// Lazy MLX Primitive — same pattern as MlaPagedAttentionDecode2passPrimitive.
+// Allocates scratch (exp_sums / max_logits / tmp_out) inside eval_gpu via
+// allocator::malloc (no memset), dispatches main + reduce on one encoder.
+class MlaPagedAttentionDecodePrMmaPrimitive : public UnaryPrimitive {
+ public:
+  MlaPagedAttentionDecodePrMmaPrimitive(
+      Stream stream, int block_size, float scale,
+      int partition_size, int max_num_partitions)
+      : UnaryPrimitive(stream),
+        block_size_(block_size), scale_(scale),
+        partition_size_(partition_size),
+        max_num_partitions_(max_num_partitions) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error(
+        "MlaPagedAttentionDecodePrMmaPrimitive only supports GPU");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    out.set_data(allocator::malloc(out.nbytes()));
+    // Inputs: [q_combined, latent_cache, block_tables, context_lens]
+    const array& q_combined = inputs[0];
+    const array& latent_cache = inputs[1];
+    const array& block_tables = inputs[2];
+    const array& context_lens = inputs[3];
+
+    int total_q_tokens = static_cast<int>(q_combined.shape(0));
+    int num_heads = static_cast<int>(q_combined.shape(1));
+    int kv_lora_rank = static_cast<int>(out.shape(2));
+
+    Shape exp_sums_shape = {total_q_tokens, num_heads, max_num_partitions_};
+    array exp_sums(exp_sums_shape, float32, nullptr, {});
+    exp_sums.set_data(allocator::malloc(exp_sums.nbytes()));
+
+    Shape max_logits_shape = {total_q_tokens, num_heads, max_num_partitions_};
+    array max_logits(max_logits_shape, float32, nullptr, {});
+    max_logits.set_data(allocator::malloc(max_logits.nbytes()));
+
+    Shape tmp_out_shape = {
+        total_q_tokens, num_heads, max_num_partitions_, kv_lora_rank};
+    array tmp_out(tmp_out_shape, q_combined.dtype(), nullptr, {});
+    tmp_out.set_data(allocator::malloc(tmp_out.nbytes()));
+
+    dispatch_mla_paged_attention_decode_pr_mma(
+        out, exp_sums, max_logits, tmp_out,
+        q_combined, latent_cache, block_tables, context_lens,
+        block_size_, scale_, partition_size_, max_num_partitions_,
+        stream(),
+        /*from_primitive=*/true);
+  }
+
+  const char* name() const override { return "MlaPagedAttentionDecodePrMma"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    auto* rhs =
+        dynamic_cast<const MlaPagedAttentionDecodePrMmaPrimitive*>(&other);
+    return rhs && rhs->block_size_ == block_size_
+        && rhs->scale_ == scale_
+        && rhs->partition_size_ == partition_size_
+        && rhs->max_num_partitions_ == max_num_partitions_;
+  }
+
+ private:
+  int block_size_;
+  float scale_;
+  int partition_size_;
+  int max_num_partitions_;
+};
+
+static array mla_paged_attention_decode_pr_mma_primitive_fn(
+    const array& q_combined,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    int block_size, float scale,
+    int partition_size, int max_num_partitions) {
+  auto prim = std::make_shared<MlaPagedAttentionDecodePrMmaPrimitive>(
+      default_stream(Device::gpu), block_size, scale,
+      partition_size, max_num_partitions);
+  // out shape: [total_q_tokens, num_heads, KV_LORA_RANK]
+  const int total_q_tokens = static_cast<int>(q_combined.shape(0));
+  const int num_heads = static_cast<int>(q_combined.shape(1));
+  constexpr int KV_LORA_RANK = 512;
+  Shape out_shape = {total_q_tokens, num_heads, KV_LORA_RANK};
+  return array(
+      out_shape, q_combined.dtype(), std::move(prim),
+      {q_combined, latent_cache, block_tables, context_lens});
+}
+
+// 2pass decode as a lazy MLX Primitive. Same rationale as
+// the single-pass / FA primitives — the kernel call joins the
+// wrapper's lazy graph instead of forcing an mx.eval boundary. Adds
+// scratch allocation inside eval_gpu so the (exp_sums / max_logits /
+// tmp_out) buffers never cross the Python boundary; the partitioned
+// kernel + reduce kernel dispatch as a single encoder pass and the
+// scratch goes out of scope right after.
+class MlaPagedAttentionDecode2passPrimitive : public UnaryPrimitive {
+ public:
+  MlaPagedAttentionDecode2passPrimitive(
+      Stream stream, int block_size, float scale,
+      int partition_size, int max_num_partitions)
+      : UnaryPrimitive(stream),
+        block_size_(block_size), scale_(scale),
+        partition_size_(partition_size),
+        max_num_partitions_(max_num_partitions) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error(
+        "MlaPagedAttentionDecode2passPrimitive only supports GPU");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    out.set_data(allocator::malloc(out.nbytes()));
+    // Inputs: [q_nope, q_pe, latent_cache, block_tables, context_lens]
+    const array& q_nope = inputs[0];
+    const array& q_pe = inputs[1];
+    const array& latent_cache = inputs[2];
+    const array& block_tables = inputs[3];
+    const array& context_lens = inputs[4];
+
+    int total_q_tokens = static_cast<int>(q_nope.shape(0));
+    int num_heads = static_cast<int>(q_nope.shape(1));
+    int kv_lora_rank = static_cast<int>(q_nope.shape(2));
+
+    // Allocate scratch with uninitialised memory — the partitioned
+    // kernel writes every (seq, head, partition) entry it consumes.
+    // ``allocator::malloc`` skips the memset that ``mx.zeros`` would
+    // schedule.
+    Shape exp_sums_shape = {total_q_tokens, num_heads, max_num_partitions_};
+    array exp_sums(exp_sums_shape, float32, nullptr, {});
+    exp_sums.set_data(allocator::malloc(exp_sums.nbytes()));
+
+    Shape max_logits_shape = {total_q_tokens, num_heads, max_num_partitions_};
+    array max_logits(max_logits_shape, float32, nullptr, {});
+    max_logits.set_data(allocator::malloc(max_logits.nbytes()));
+
+    Shape tmp_out_shape = {
+        total_q_tokens, num_heads, max_num_partitions_, kv_lora_rank};
+    array tmp_out(tmp_out_shape, q_nope.dtype(), nullptr, {});
+    tmp_out.set_data(allocator::malloc(tmp_out.nbytes()));
+
+    dispatch_mla_paged_attention_decode_2pass(
+        out, exp_sums, max_logits, tmp_out,
+        q_nope, q_pe, latent_cache, block_tables, context_lens,
+        block_size_, scale_, partition_size_, max_num_partitions_,
+        stream(),
+        /*from_primitive=*/true);
+  }
+
+  const char* name() const override { return "MlaPagedAttentionDecode2pass"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    auto* rhs =
+        dynamic_cast<const MlaPagedAttentionDecode2passPrimitive*>(&other);
+    return rhs && rhs->block_size_ == block_size_
+        && rhs->scale_ == scale_
+        && rhs->partition_size_ == partition_size_
+        && rhs->max_num_partitions_ == max_num_partitions_;
+  }
+
+ private:
+  int block_size_;
+  float scale_;
+  int partition_size_;
+  int max_num_partitions_;
+};
+
+static array mla_paged_attention_decode_2pass_primitive_fn(
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    int block_size, float scale,
+    int partition_size, int max_num_partitions) {
+  auto prim = std::make_shared<MlaPagedAttentionDecode2passPrimitive>(
+      default_stream(Device::gpu), block_size, scale,
+      partition_size, max_num_partitions);
+  return array(
+      q_nope.shape(), q_nope.dtype(), std::move(prim),
+      {q_nope, q_pe, latent_cache, block_tables, context_lens});
+}
+
+// Paged FA decode kernel.
+// Tile anchor: BQ=8, BK=32, WM=1, WN=4 → 128 threads/TG. The body
+// reads/writes the same paged latent cache as the single-pass and
+// 2pass kernels; wide/narrow tile variants differ only in BK/WN.
+//
+// `use_wide` selects the alternate (BQ=8, BK=64, WM=1, WN=8 → 256
+// threads/TG) instantiation that halves V_TILES_PER_SG and doubles
+// per-iter K throughput.
+static void dispatch_mla_paged_attention_decode_fa(
+    array& out,
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    const array& cu_seqlens_q,
+    int block_size,
+    float scale,
+    bool use_wide,
+    Stream s,
+    bool from_primitive = false) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(q_nope.shape(0));
+  int num_heads = static_cast<int>(q_nope.shape(1));
+  int kv_lora_rank = static_cast<int>(q_nope.shape(2));
+  int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
+  int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+
+  // Tile shape — see decode_fa wide variant comment in mla.metal.
+  // BK=32/WN=4 is the narrow anchor; BK=64/WN=8 is the wide variant.
+  const int BQ = 8;
+  const int BK = use_wide ? 64 : 32;
+  const int WM = 1;
+  const int WN = use_wide ? 8 : 4;
+  const int THREADS_PER_TG = WM * WN * 32;
+
+  if (kv_lora_rank != 512) {
+    throw std::runtime_error(
+        "MLA FA decode kernel: only kv_lora_rank=512 is instantiated; got " +
+        std::to_string(kv_lora_rank));
+  }
+  if (qk_rope_head_dim != 64) {
+    throw std::runtime_error(
+        "MLA FA decode kernel: only qk_rope_head_dim=64 is instantiated; got " +
+        std::to_string(qk_rope_head_dim));
+  }
+  if (block_size != 16) {
+    throw std::runtime_error(
+        "MLA FA decode kernel: only block_size=16 is instantiated; got " +
+        std::to_string(block_size));
+  }
+  if (num_heads % BQ != 0) {
+    throw std::runtime_error(
+        "MLA FA decode kernel: num_heads (" + std::to_string(num_heads) +
+        ") must be a multiple of BQ=" + std::to_string(BQ));
+  }
+  mla_validate_t_dtypes("MLA FA decode kernel", {
+      {"q_nope", &q_nope},
+      {"q_pe", &q_pe},
+      {"latent_cache", &latent_cache},
+      {"out", &out},
+  });
+
+  int num_head_groups = num_heads / BQ;
+
+  auto dt = dtype_to_metal(q_nope.dtype());
+  std::string kname = "paged_mla_attention_decode_fa_" + dt + "_kvr" +
+                      std::to_string(kv_lora_rank) + "_pe" +
+                      std::to_string(qk_rope_head_dim) + "_bs" +
+                      std::to_string(block_size) + "_bq" + std::to_string(BQ) +
+                      "_bk" + std::to_string(BK) + "_wm" + std::to_string(WM) +
+                      "_wn" + std::to_string(WN);
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_output_array(out, 0);
+  enc.set_input_array(q_nope, 1);
+  enc.set_input_array(q_pe, 2);
+  enc.set_input_array(latent_cache, 3);
+  enc.set_input_array(block_tables, 4);
+  enc.set_input_array(context_lens, 5);
+  enc.set_input_array(cu_seqlens_q, 6);
+
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  int32_t num_heads_i = static_cast<int32_t>(num_heads);
+  enc.set_bytes(max_blocks_i, 7);
+  enc.set_bytes(num_heads_i, 8);
+  enc.set_bytes(scale, 9);
+
+  // Grid: (total_q_tokens, num_head_groups, 1). Threads/TG = WN * 32
+  // (WM=1 collapses the M-axis simdgroup dim).
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(total_q_tokens, num_head_groups, 1),
+      MTL::Size::Make(THREADS_PER_TG, 1, 1));
+
+  if (!from_primitive) {
+    add_temporary_compat(enc, out, d, s);
+    add_temporary_compat(enc, q_nope, d, s);
+    add_temporary_compat(enc, q_pe, d, s);
+    add_temporary_compat(enc, latent_cache, d, s);
+    add_temporary_compat(enc, block_tables, d, s);
+    add_temporary_compat(enc, context_lens, d, s);
+    add_temporary_compat(enc, cu_seqlens_q, d, s);
+  }
+}
+
+// Partitioned FA decode kernel.
+// Same per-partition pipeline as dispatch_mla_paged_attention_decode_fa
+// above, but each TG handles one PARTITION_SIZE slice of ctx and writes
+// (max, sum, normalized partial). The existing
+// paged_mla_attention_reduce kernel does the cross-partition merge —
+// same contract as decode_2pass.
+static void dispatch_mla_paged_attention_decode_fa_partitioned(
+    array& out,
+    array& exp_sums,
+    array& max_logits,
+    array& tmp_out,
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    bool use_wide,
+    Stream s,
+    bool from_primitive = false) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(q_nope.shape(0));
+  int num_heads = static_cast<int>(q_nope.shape(1));
+  int kv_lora_rank = static_cast<int>(q_nope.shape(2));
+  int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
+  int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+
+  // See decode_fa wide variant comment in mla.metal.
+  const int BQ = 8;
+  const int BK = use_wide ? 64 : 32;
+  const int WM = 1;
+  const int WN = use_wide ? 8 : 4;
+  const int THREADS_PER_TG = WM * WN * 32;
+
+  if (kv_lora_rank != 512) {
+    throw std::runtime_error(
+        "MLA FA partitioned kernel: only kv_lora_rank=512 is instantiated; "
+        "got " +
+        std::to_string(kv_lora_rank));
+  }
+  if (qk_rope_head_dim != 64) {
+    throw std::runtime_error(
+        "MLA FA partitioned kernel: only qk_rope_head_dim=64 is instantiated; "
+        "got " +
+        std::to_string(qk_rope_head_dim));
+  }
+  if (block_size != 16) {
+    throw std::runtime_error(
+        "MLA FA partitioned kernel: only block_size=16 is instantiated; got " +
+        std::to_string(block_size));
+  }
+  if (partition_size != 64 && partition_size != 128 && partition_size != 512) {
+    throw std::runtime_error(
+        "MLA FA partitioned kernel: partition_size must be in {64, 128, 512}; "
+        "got " +
+        std::to_string(partition_size));
+  }
+  if (num_heads % BQ != 0) {
+    throw std::runtime_error(
+        "MLA FA partitioned kernel: num_heads (" + std::to_string(num_heads) +
+        ") must be a multiple of BQ=" + std::to_string(BQ));
+  }
+  mla_validate_t_dtypes("MLA FA partitioned kernel", {
+      {"q_nope", &q_nope},
+      {"q_pe", &q_pe},
+      {"latent_cache", &latent_cache},
+      {"out", &out},
+      {"tmp_out", &tmp_out},
+  });
+
+  int num_head_groups = num_heads / BQ;
+
+  auto dt = dtype_to_metal(q_nope.dtype());
+  std::string kname =
+      "paged_mla_attention_decode_fa_partitioned_" + dt + "_kvr" +
+      std::to_string(kv_lora_rank) + "_pe" + std::to_string(qk_rope_head_dim) +
+      "_bs" + std::to_string(block_size) + "_bq" + std::to_string(BQ) + "_bk" +
+      std::to_string(BK) + "_wm" + std::to_string(WM) + "_wn" +
+      std::to_string(WN) + "_ps" + std::to_string(partition_size);
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  enc.set_output_array(tmp_out, 2);
+  enc.set_input_array(q_nope, 3);
+  enc.set_input_array(q_pe, 4);
+  enc.set_input_array(latent_cache, 5);
+  enc.set_input_array(block_tables, 6);
+  enc.set_input_array(context_lens, 7);
+
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  int32_t num_heads_i = static_cast<int32_t>(num_heads);
+  enc.set_bytes(max_blocks_i, 8);
+  enc.set_bytes(num_heads_i, 9);
+  enc.set_bytes(scale, 10);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(total_q_tokens, num_head_groups, max_num_partitions),
+      MTL::Size::Make(THREADS_PER_TG, 1, 1));
+
+  // Reuse the same reduce kernel as 2pass — same partial contract.
+  constexpr int REDUCE_NUM_THREADS = 256;
+  constexpr int REDUCE_NUM_WARPS = REDUCE_NUM_THREADS / 32;
+  std::string reduce_kname = "paged_mla_attention_reduce_" + dt + "_hs" +
+                             std::to_string(kv_lora_rank) + "_nt256_nsl32_ps" +
+                             std::to_string(partition_size);
+  auto* reduce_kernel = d.get_kernel(reduce_kname, lib, reduce_kname, {});
+
+  size_t reduce_shmem = static_cast<size_t>(
+      (2 * max_num_partitions + 2 * REDUCE_NUM_WARPS) * sizeof(float));
+
+  enc.set_compute_pipeline_state(reduce_kernel);
+  enc.set_threadgroup_memory_length(reduce_shmem, 0);
+
+  enc.set_output_array(out, 0);
+  enc.set_input_array(exp_sums, 1);
+  enc.set_input_array(max_logits, 2);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(context_lens, 4);
+  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+  enc.set_bytes(max_num_partitions_i, 5);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(REDUCE_NUM_THREADS, 1, 1));
+
+  if (!from_primitive) {
+    add_temporary_compat(enc, out, d, s);
+    add_temporary_compat(enc, exp_sums, d, s);
+    add_temporary_compat(enc, max_logits, d, s);
+    add_temporary_compat(enc, tmp_out, d, s);
+    add_temporary_compat(enc, q_nope, d, s);
+    add_temporary_compat(enc, q_pe, d, s);
+    add_temporary_compat(enc, latent_cache, d, s);
+    add_temporary_compat(enc, block_tables, d, s);
+    add_temporary_compat(enc, context_lens, d, s);
+  }
+}
+
+void mla_paged_attention_decode_fa_partitioned_impl(
+    nb::handle out_h,
+    nb::handle exp_sums_h,
+    nb::handle max_logits_h,
+    nb::handle tmp_out_h,
+    nb::handle q_nope_h,
+    nb::handle q_pe_h,
+    nb::handle latent_cache_h,
+    nb::handle block_tables_h,
+    nb::handle context_lens_h,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    bool use_wide) {
+  auto& out = *nb::inst_ptr<array>(out_h);
+  auto& exp_sums = *nb::inst_ptr<array>(exp_sums_h);
+  auto& max_logits = *nb::inst_ptr<array>(max_logits_h);
+  auto& tmp_out = *nb::inst_ptr<array>(tmp_out_h);
+  auto& q_nope = *nb::inst_ptr<array>(q_nope_h);
+  auto& q_pe = *nb::inst_ptr<array>(q_pe_h);
+  auto& latent_cache = *nb::inst_ptr<array>(latent_cache_h);
+  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
+  auto& context_lens = *nb::inst_ptr<array>(context_lens_h);
+
+  dispatch_mla_paged_attention_decode_fa_partitioned(
+      out, exp_sums, max_logits, tmp_out, q_nope, q_pe, latent_cache,
+      block_tables, context_lens, block_size, scale, partition_size,
+      max_num_partitions, use_wide, default_stream(Device::gpu));
+}
+
+void mla_paged_attention_decode_fa_impl(
+    nb::handle out_h,
+    nb::handle q_nope_h,
+    nb::handle q_pe_h,
+    nb::handle latent_cache_h,
+    nb::handle block_tables_h,
+    nb::handle context_lens_h,
+    nb::handle cu_seqlens_q_h,
+    int block_size,
+    float scale,
+    bool use_wide) {
+  auto& out = *nb::inst_ptr<array>(out_h);
+  auto& q_nope = *nb::inst_ptr<array>(q_nope_h);
+  auto& q_pe = *nb::inst_ptr<array>(q_pe_h);
+  auto& latent_cache = *nb::inst_ptr<array>(latent_cache_h);
+  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
+  auto& context_lens = *nb::inst_ptr<array>(context_lens_h);
+  auto& cu_seqlens_q = *nb::inst_ptr<array>(cu_seqlens_q_h);
+
+  dispatch_mla_paged_attention_decode_fa(
+      out, q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q,
+      block_size, scale, use_wide, default_stream(Device::gpu));
+}
+
+// FA decode as a lazy MLX Primitive — Phase 4. Same rationale as the
+// single-pass MlaPagedAttentionPrimitive: joining the wrapper's lazy
+// graph saves the per-call mx.eval boundary the eager binding forces.
+class MlaPagedAttentionDecodeFaPrimitive : public UnaryPrimitive {
+ public:
+  MlaPagedAttentionDecodeFaPrimitive(
+      Stream stream, int block_size, float scale, bool use_wide)
+      : UnaryPrimitive(stream),
+        block_size_(block_size), scale_(scale), use_wide_(use_wide) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error(
+        "MlaPagedAttentionDecodeFaPrimitive only supports GPU");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    out.set_data(allocator::malloc(out.nbytes()));
+    dispatch_mla_paged_attention_decode_fa(
+        out,
+        inputs[0], inputs[1], inputs[2],
+        inputs[3], inputs[4], inputs[5],
+        block_size_, scale_, use_wide_,
+        stream(),
+        /*from_primitive=*/true);
+  }
+
+  const char* name() const override { return "MlaPagedAttentionDecodeFa"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    auto* rhs = dynamic_cast<const MlaPagedAttentionDecodeFaPrimitive*>(&other);
+    return rhs && rhs->block_size_ == block_size_
+        && rhs->scale_ == scale_ && rhs->use_wide_ == use_wide_;
+  }
+
+ private:
+  int block_size_;
+  float scale_;
+  bool use_wide_;
+};
+
+static array mla_paged_attention_decode_fa_primitive_fn(
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    const array& cu_seqlens_q,
+    int block_size, float scale, bool use_wide) {
+  auto prim = std::make_shared<MlaPagedAttentionDecodeFaPrimitive>(
+      default_stream(Device::gpu), block_size, scale, use_wide);
+  return array(
+      q_nope.shape(), q_nope.dtype(), std::move(prim),
+      {q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q});
+}
+
+void mla_paged_attention_decode_2pass_impl(
+    nb::handle out_h,
+    nb::handle exp_sums_h,
+    nb::handle max_logits_h,
+    nb::handle tmp_out_h,
+    nb::handle q_nope_h,
+    nb::handle q_pe_h,
+    nb::handle latent_cache_h,
+    nb::handle block_tables_h,
+    nb::handle context_lens_h,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions) {
+  auto& out = *nb::inst_ptr<array>(out_h);
+  auto& exp_sums = *nb::inst_ptr<array>(exp_sums_h);
+  auto& max_logits = *nb::inst_ptr<array>(max_logits_h);
+  auto& tmp_out = *nb::inst_ptr<array>(tmp_out_h);
+  auto& q_nope = *nb::inst_ptr<array>(q_nope_h);
+  auto& q_pe = *nb::inst_ptr<array>(q_pe_h);
+  auto& latent_cache = *nb::inst_ptr<array>(latent_cache_h);
+  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
+  auto& context_lens = *nb::inst_ptr<array>(context_lens_h);
+
+  dispatch_mla_paged_attention_decode_2pass(
+      out, exp_sums, max_logits, tmp_out, q_nope, q_pe, latent_cache,
+      block_tables, context_lens, block_size, scale, partition_size,
+      max_num_partitions, default_stream(Device::gpu));
+}
+
+// Bench-only impls. Not part of any production path.
+void mla_paged_attention_decode_2pass_main_only_impl(
+    nb::handle exp_sums_h,
+    nb::handle max_logits_h,
+    nb::handle tmp_out_h,
+    nb::handle q_nope_h,
+    nb::handle q_pe_h,
+    nb::handle latent_cache_h,
+    nb::handle block_tables_h,
+    nb::handle context_lens_h,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions) {
+  dispatch_mla_paged_attention_decode_2pass_main_only(
+      *nb::inst_ptr<array>(exp_sums_h),
+      *nb::inst_ptr<array>(max_logits_h),
+      *nb::inst_ptr<array>(tmp_out_h),
+      *nb::inst_ptr<array>(q_nope_h),
+      *nb::inst_ptr<array>(q_pe_h),
+      *nb::inst_ptr<array>(latent_cache_h),
+      *nb::inst_ptr<array>(block_tables_h),
+      *nb::inst_ptr<array>(context_lens_h),
+      block_size, scale, partition_size, max_num_partitions,
+      default_stream(Device::gpu));
+}
+
+void mla_paged_attention_decode_2pass_reduce_only_impl(
+    nb::handle out_h,
+    nb::handle exp_sums_h,
+    nb::handle max_logits_h,
+    nb::handle tmp_out_h,
+    nb::handle context_lens_h,
+    int partition_size,
+    int max_num_partitions) {
+  dispatch_mla_paged_attention_decode_2pass_reduce_only(
+      *nb::inst_ptr<array>(out_h),
+      *nb::inst_ptr<array>(exp_sums_h),
+      *nb::inst_ptr<array>(max_logits_h),
+      *nb::inst_ptr<array>(tmp_out_h),
+      *nb::inst_ptr<array>(context_lens_h),
+      partition_size, max_num_partitions,
+      default_stream(Device::gpu));
+}
+
+void mla_paged_attention_decode_pr_mma_main_impl(
+    nb::handle exp_sums_h,
+    nb::handle max_logits_h,
+    nb::handle tmp_out_h,
+    nb::handle q_combined_h,
+    nb::handle latent_cache_h,
+    nb::handle block_tables_h,
+    nb::handle context_lens_h,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions) {
+  dispatch_mla_paged_attention_decode_pr_mma_main(
+      *nb::inst_ptr<array>(exp_sums_h),
+      *nb::inst_ptr<array>(max_logits_h),
+      *nb::inst_ptr<array>(tmp_out_h),
+      *nb::inst_ptr<array>(q_combined_h),
+      *nb::inst_ptr<array>(latent_cache_h),
+      *nb::inst_ptr<array>(block_tables_h),
+      *nb::inst_ptr<array>(context_lens_h),
+      block_size, scale, partition_size, max_num_partitions,
+      default_stream(Device::gpu));
+}
+
 void gdn_linear_attention_impl(
     nb::handle q_h, nb::handle k_h, nb::handle v_h,
     nb::handle g_h, nb::handle beta_h,
@@ -1290,4 +3058,247 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("slot_mapping"), nb::arg("y"),
         nb::arg("Hk"), nb::arg("Hv"), nb::arg("Dk"), nb::arg("Dv"),
         "GDN linear attention with in-place paged state management.");
+
+  m.def("init_mla_library", &init_mla_library,
+        nb::arg("src"),
+        "JIT-compile the MLA paged attention Metal shader (RFC #360).");
+
+  m.def("mla_paged_attention", &mla_paged_attention_impl,
+        nb::arg("out"),
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("heads_per_tg") = 1,
+        "Paged MLA (single-pass), eager in-place dispatch. Kept for "
+        "bench / tests; production wrapper uses the primitive variant.");
+
+  // Primitive variant — same RTTI workaround as paged_attention_primitive:
+  // take nb::handle, build the result on the C++ side, then
+  // overwrite_descriptor into a caller-provided out array. Returning
+  // mx::core::array directly across the nanobind module boundary trips
+  // RTTI in MLX's separate module.
+  m.def("mla_paged_attention_primitive",
+        [](nb::handle q_nope_h,
+           nb::handle q_pe_h,
+           nb::handle latent_cache_h,
+           nb::handle block_tables_h,
+           nb::handle context_lens_h,
+           nb::handle cu_seqlens_q_h,
+           int block_size, float scale, int heads_per_tg,
+           nb::handle out_h) {
+          auto result = mla_paged_attention_primitive_fn(
+              *nb::inst_ptr<array>(q_nope_h),
+              *nb::inst_ptr<array>(q_pe_h),
+              *nb::inst_ptr<array>(latent_cache_h),
+              *nb::inst_ptr<array>(block_tables_h),
+              *nb::inst_ptr<array>(context_lens_h),
+              *nb::inst_ptr<array>(cu_seqlens_q_h),
+              block_size, scale, heads_per_tg);
+          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
+        },
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("heads_per_tg") = 1,
+        nb::arg("out"),
+        "Paged MLA (single-pass), wrapped as an MLX Primitive — fills "
+        "``out`` with a lazy descriptor so the kernel call participates "
+        "in the wrapper's lazy graph and avoids the per-call mx.eval "
+        "boundary the eager binding requires. Saves ~200 μs at B=1 "
+        "small-H cells where dispatch overhead dominates.");
+
+  m.def("mla_paged_attention_partitioned",
+        &mla_paged_attention_partitioned_impl,
+        nb::arg("out"),
+        nb::arg("exp_sums"), nb::arg("max_logits"), nb::arg("tmp_out"),
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("partition_size"), nb::arg("max_num_partitions"),
+        nb::arg("heads_per_tg") = 1,
+        "Paged MLA attention with split-K + reduce (RFC #360 Phase 3).");
+
+  m.def("mla_paged_attention_decode_fa",
+        &mla_paged_attention_decode_fa_impl,
+        nb::arg("out"),
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("use_wide") = false,
+        "Paged FA decode kernel using simdgroup_matrix<T, 8, 8> MMAs.");
+
+  // FA decode primitive variant — Phase 4. Saves the per-call mx.eval
+  // boundary the eager binding forces, same pattern as single-pass.
+  m.def("mla_paged_attention_decode_fa_primitive",
+        [](nb::handle q_nope_h,
+           nb::handle q_pe_h,
+           nb::handle latent_cache_h,
+           nb::handle block_tables_h,
+           nb::handle context_lens_h,
+           nb::handle cu_seqlens_q_h,
+           int block_size, float scale, bool use_wide,
+           nb::handle out_h) {
+          auto result = mla_paged_attention_decode_fa_primitive_fn(
+              *nb::inst_ptr<array>(q_nope_h),
+              *nb::inst_ptr<array>(q_pe_h),
+              *nb::inst_ptr<array>(latent_cache_h),
+              *nb::inst_ptr<array>(block_tables_h),
+              *nb::inst_ptr<array>(context_lens_h),
+              *nb::inst_ptr<array>(cu_seqlens_q_h),
+              block_size, scale, use_wide);
+          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
+        },
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("use_wide") = false,
+        nb::arg("out"),
+        "Lazy MLX Primitive variant of the FA decode kernel.");
+
+  m.def("mla_paged_attention_decode_fa_partitioned",
+        &mla_paged_attention_decode_fa_partitioned_impl,
+        nb::arg("out"),
+        nb::arg("exp_sums"), nb::arg("max_logits"), nb::arg("tmp_out"),
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("partition_size"), nb::arg("max_num_partitions"),
+        nb::arg("use_wide") = false,
+        "Partitioned (split-K + reduce) variant of the FA decode kernel "
+        "for long-ctx workloads. Same per-partition pipeline as "
+        "mla_paged_attention_decode_fa; reuses the same reduce kernel "
+        "as the 2pass entry.");
+
+  m.def("mla_paged_attention_decode_2pass",
+        &mla_paged_attention_decode_2pass_impl,
+        nb::arg("out"),
+        nb::arg("exp_sums"), nb::arg("max_logits"), nb::arg("tmp_out"),
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("partition_size"), nb::arg("max_num_partitions"),
+        "MLX sdpa_vector_2pass-style cross-head amortization for absorbed "
+        "MLA decode. One TG per (seq, partition) with 32*num_heads threads, "
+        "all heads sharing K cache reads.");
+
+  // 2pass primitive. Inputs: q_nope, q_pe, latent_cache,
+  // block_tables, context_lens. Allocates exp_sums / max_logits /
+  // tmp_out internally inside eval_gpu — scratch never reaches Python.
+  m.def("mla_paged_attention_decode_2pass_primitive",
+        [](nb::handle q_nope_h,
+           nb::handle q_pe_h,
+           nb::handle latent_cache_h,
+           nb::handle block_tables_h,
+           nb::handle context_lens_h,
+           int block_size, float scale,
+           int partition_size, int max_num_partitions,
+           nb::handle out_h) {
+          auto result = mla_paged_attention_decode_2pass_primitive_fn(
+              *nb::inst_ptr<array>(q_nope_h),
+              *nb::inst_ptr<array>(q_pe_h),
+              *nb::inst_ptr<array>(latent_cache_h),
+              *nb::inst_ptr<array>(block_tables_h),
+              *nb::inst_ptr<array>(context_lens_h),
+              block_size, scale,
+              partition_size, max_num_partitions);
+          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
+        },
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("partition_size"), nb::arg("max_num_partitions"),
+        nb::arg("out"),
+        "Lazy MLX Primitive variant of the 2pass decode kernel. Scratch "
+        "(exp_sums / max_logits / tmp_out) lives inside eval_gpu and "
+        "never crosses the Python boundary; the partitioned kernel + "
+        "reduce kernel share one encoder pass.");
+
+  // Bench-only entries. Same kernels as the production 2pass path,
+  // but split across two encoders so a bench harness can
+  // mx.synchronize() between them and time each kernel in isolation.
+  // Do NOT use from production: the synchronize between adds an
+  // extra GPU round-trip per dispatch.
+  m.def("mla_paged_attention_decode_2pass_main_only",
+        &mla_paged_attention_decode_2pass_main_only_impl,
+        nb::arg("exp_sums"), nb::arg("max_logits"), nb::arg("tmp_out"),
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("partition_size"), nb::arg("max_num_partitions"),
+        "Bench-only — runs only the partitioned main kernel of the 2pass "
+        "decode dispatch. Writes exp_sums / max_logits / tmp_out; does "
+        "not run the reduce kernel.");
+
+  m.def("mla_paged_attention_decode_2pass_reduce_only",
+        &mla_paged_attention_decode_2pass_reduce_only_impl,
+        nb::arg("out"),
+        nb::arg("exp_sums"), nb::arg("max_logits"), nb::arg("tmp_out"),
+        nb::arg("context_lens"),
+        nb::arg("partition_size"), nb::arg("max_num_partitions"),
+        "Bench-only — runs only the reduce kernel of the 2pass decode "
+        "dispatch. Reads exp_sums / max_logits / tmp_out (assumed already "
+        "populated by a prior main-only call) and writes out.");
+
+  // Per-request MMA paged decode — lazy MLX Primitive.
+  // Reads q_combined (concat of q_nope + q_pe), paged latent cache,
+  // block_tables, context_lens. Allocates scratch internally inside
+  // eval_gpu; main + reduce dispatched on a single encoder. Returns
+  // a lazy Primitive node so the wrapper graph holds the inputs alive
+  // across the dispatch.
+  m.def("mla_paged_attention_decode_pr_mma_primitive",
+        [](nb::handle q_combined_h,
+           nb::handle latent_cache_h,
+           nb::handle block_tables_h,
+           nb::handle context_lens_h,
+           int block_size, float scale,
+           int partition_size, int max_num_partitions,
+           nb::handle out_h) {
+          auto result = mla_paged_attention_decode_pr_mma_primitive_fn(
+              *nb::inst_ptr<array>(q_combined_h),
+              *nb::inst_ptr<array>(latent_cache_h),
+              *nb::inst_ptr<array>(block_tables_h),
+              *nb::inst_ptr<array>(context_lens_h),
+              block_size, scale,
+              partition_size, max_num_partitions);
+          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
+        },
+        nb::arg("q_combined"), nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("partition_size"), nb::arg("max_num_partitions"),
+        nb::arg("out"),
+        "Lazy MLX Primitive — per-request MMA paged decode. Main kernel "
+        "uses simdgroup_matrix + reduce kernel reused. Instantiated for "
+        "KVR=512, PE=64, bs ∈ {16, 32}, ps=128, hpt=32, wm=4, wn=8 — "
+        "fp16 + bf16.");
+
+  // Per-request MMA paged main, bench-only. Full main kernel with
+  // paged K/V, per-partition softmax, SV MMA. Writes same scratch
+  // contract as 2pass main; existing reduce kernel applies. Eager
+  // dispatch — production routing uses the lazy Primitive variant
+  // above.
+  m.def("mla_paged_attention_decode_pr_mma_main",
+        &mla_paged_attention_decode_pr_mma_main_impl,
+        nb::arg("exp_sums"), nb::arg("max_logits"), nb::arg("tmp_out"),
+        nb::arg("q_combined"), nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("partition_size"), nb::arg("max_num_partitions"),
+        "Bench-only — per-request MMA paged main kernel. "
+        "fp16 + bf16 / KVR=512 / PE=64 / bs ∈ {16, 32} / ps=128 / "
+        "hpt=32 instantiated.");
 }
