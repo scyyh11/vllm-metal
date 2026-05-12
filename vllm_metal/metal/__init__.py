@@ -39,6 +39,12 @@ _ops_module: ModuleType | None = None
 # paged-attention user, so non-MLA models pay the compile cost and a
 # compile error in MLA would block unrelated paged-attention paths.
 _mla_library_initialized: bool = False
+# Cached result of the runtime probe for bf16 FA kernel availability.
+# On targets without native bfloat support, mla.metal gates the bfloat16_t
+# FA instantiations away (simdgroup_matrix can't take the fallback struct),
+# so calling FA with bf16 must be rejected up-front rather than tripping a
+# bare get_kernel error inside C++.
+_bf16_fa_available: bool | None = None
 
 
 def _read_metal_source(path: Path) -> str:
@@ -419,6 +425,11 @@ def metal_mla_paged_attention_partitioned(
 # 256 is kept as a bench knob between 128 and 512; auto-pick still
 # returns {64, 128}.
 _MLA_DECODE_2PASS_SIZES = (64, 128, 256, 512)
+# FA partitioned only instantiates ps ∈ {64, 128, 512} (no ps=256). Reusing
+# _MLA_DECODE_2PASS_SIZES for FA validation would let ps=256 through Python
+# and fail at C++ get_kernel; this set keeps the rejection at the Python
+# boundary.
+_MLA_DECODE_FA_PARTITION_SIZES = (64, 128, 512)
 
 
 def _pick_mla_decode_2pass_partition(max_ctx: int) -> int:
@@ -547,6 +558,232 @@ def metal_mla_paged_attention_decode_2pass(
     mx.synchronize()
 
 
+def metal_mla_paged_attention_decode_fa(
+    q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
+    q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
+    latent_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+    out,  # [total_q_tokens, num_heads, kv_lora_rank]
+    block_tables,  # [num_seqs, max_blocks_per_seq], int32
+    context_lens,  # [num_seqs], uint32
+    cu_seqlens_q,  # [num_seqs + 1], int32 (decode-only validation)
+    scale: float,
+    use_wide: bool = False,
+) -> None:
+    """Paged Flash-Attention decode kernel using ``simdgroup_matrix<T, 8, 8>``
+    MMAs.
+
+    Full FA pipeline (Q load → simdgroup_matrix QK →
+    online softmax merged across BK tiles → SV → normalize) with
+    multi-block context. Partial tail (last K-tile with valid_cols <
+    BK) is handled inside the kernel.
+
+    Shape and decode-only contract match
+    ``metal_mla_paged_attention_decode_2pass``. Additionally
+    ``num_heads`` must be a multiple of 8 (one ``simdgroup_matrix`` M
+    dim).
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
+        raise ValueError(
+            f"MLA shape mismatch: q_nope.shape[2]={q_nope.shape[2]} must equal "
+            f"latent_cache.shape[2] ({latent_cache.shape[2]}) - "
+            f"q_pe.shape[2] ({q_pe.shape[2]})"
+        )
+
+    block_size = latent_cache.shape[1]
+    num_heads = int(q_nope.shape[1])
+    if num_heads % 8 != 0:
+        raise ValueError(
+            f"MLA FA decode kernel: num_heads ({num_heads}) must be a "
+            "multiple of 8 (the simdgroup_matrix M dim)."
+        )
+
+    mx.eval(out, q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q)
+
+    cu_q = np.asarray(cu_seqlens_q)
+    deltas = np.diff(cu_q)
+    if np.any(deltas != 1):
+        bad = int(np.argmax(deltas != 1))
+        raise NotImplementedError(
+            "MLA FA decode kernel supports decode only — one query token "
+            f"per sequence. Got request {bad} with {int(deltas[bad])} query "
+            "tokens."
+        )
+
+    ctx = np.asarray(context_lens)
+    max_blocks_per_seq = int(block_tables.shape[1])
+    required_blocks = (ctx + block_size - 1) // block_size
+    if np.any(required_blocks > max_blocks_per_seq):
+        bad = int(np.argmax(required_blocks > max_blocks_per_seq))
+        raise ValueError(
+            f"MLA FA decode kernel: block_tables row width "
+            f"({max_blocks_per_seq}) too small for request {bad}: "
+            f"ctx_len={int(ctx[bad])} requires "
+            f"{int(required_blocks[bad])} blocks at block_size={block_size}."
+        )
+
+    if np.any(ctx <= 0):
+        bad = int(np.argmax(ctx <= 0))
+        raise ValueError(
+            "MLA FA decode kernel: every context_len must be positive; "
+            f"got ctx_len={int(ctx[bad])} for request {bad}."
+        )
+
+    ops = get_ops()
+    _ensure_mla_library(ops)
+    if q_nope.dtype == mx.bfloat16 and not mla_bf16_fa_available():
+        raise ValueError(
+            "MLA FA decode kernel: bfloat16 inputs require native bfloat "
+            "support on the Metal device; the running device falls back to "
+            "a struct representation that simdgroup_matrix cannot use, so "
+            "the bf16 FA kernels were gated out at metallib compile time. "
+            "Use float16, or wait for the routing follow-up that picks an "
+            "alternate route for bf16."
+        )
+    ops.mla_paged_attention_decode_fa(
+        out,
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_size,
+        scale,
+        use_wide,
+    )
+    mx.synchronize()
+
+
+def metal_mla_paged_attention_decode_fa_partitioned(
+    q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
+    q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
+    latent_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+    out,  # [total_q_tokens, num_heads, kv_lora_rank]
+    block_tables,  # [num_seqs, max_blocks_per_seq], int32
+    context_lens,  # [num_seqs], uint32
+    cu_seqlens_q,  # [num_seqs + 1], int32 (decode-only validation)
+    scale: float,
+    partition_size: int | None = None,
+    use_wide: bool = False,
+) -> None:
+    """Split-K + reduce variant of the paged FA decode kernel. Each
+    (seq, head_group, partition) threadgroup processes one
+    ``partition_size``-token slice of ctx and writes a normalized partial;
+    the same reduce kernel used by ``metal_mla_paged_attention_decode_2pass``
+    merges across partitions.
+
+    Targets long-ctx decode where the non-partitioned FA is
+    bandwidth-bound on the K stream. Same shape + decode-only contract
+    as the other FA / 2pass entries.
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
+        raise ValueError(
+            f"MLA shape mismatch: q_nope.shape[2]={q_nope.shape[2]} must equal "
+            f"latent_cache.shape[2] ({latent_cache.shape[2]}) - "
+            f"q_pe.shape[2] ({q_pe.shape[2]})"
+        )
+
+    block_size = latent_cache.shape[1]
+    num_heads = int(q_nope.shape[1])
+    if num_heads % 8 != 0:
+        raise ValueError(
+            f"MLA FA partitioned kernel: num_heads ({num_heads}) must be a "
+            "multiple of 8 (the simdgroup_matrix M dim)."
+        )
+
+    mx.eval(out, q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q)
+
+    cu_q = np.asarray(cu_seqlens_q)
+    deltas = np.diff(cu_q)
+    if np.any(deltas != 1):
+        bad = int(np.argmax(deltas != 1))
+        raise NotImplementedError(
+            "MLA FA partitioned kernel supports decode only — one query token "
+            f"per sequence. Got request {bad} with {int(deltas[bad])} query "
+            "tokens."
+        )
+
+    ctx = np.asarray(context_lens)
+    max_blocks_per_seq = int(block_tables.shape[1])
+    required_blocks = (ctx + block_size - 1) // block_size
+    if np.any(required_blocks > max_blocks_per_seq):
+        bad = int(np.argmax(required_blocks > max_blocks_per_seq))
+        raise ValueError(
+            f"MLA FA partitioned: block_tables row width ({max_blocks_per_seq}) "
+            f"too small for request {bad}: ctx_len={int(ctx[bad])} requires "
+            f"{int(required_blocks[bad])} blocks at block_size={block_size}."
+        )
+
+    if np.any(ctx <= 0):
+        bad = int(np.argmax(ctx <= 0))
+        raise ValueError(
+            "MLA FA partitioned: every context_len must be positive; got "
+            f"ctx_len={int(ctx[bad])} for request {bad}."
+        )
+
+    total_q_tokens = int(q_nope.shape[0])
+    kv_lora_rank = int(q_nope.shape[2])
+    max_ctx = int(ctx.max())
+
+    # Mirrors _pick_mla_decode_2pass_partition: 64 for ctx ≤ 1024, 128
+    # for longer. Caller can override — but FA partitioned only
+    # instantiates {64, 128, 512}, not the full 2pass set.
+    if partition_size is None:
+        partition_size = _pick_mla_decode_2pass_partition(max_ctx)
+    if partition_size not in _MLA_DECODE_FA_PARTITION_SIZES:
+        raise ValueError(
+            f"MLA FA partitioned: partition_size must be in "
+            f"{_MLA_DECODE_FA_PARTITION_SIZES}; got {partition_size}"
+        )
+
+    max_num_partitions = max(1, (max_ctx + partition_size - 1) // partition_size)
+
+    exp_sums = mx.zeros(
+        (total_q_tokens, num_heads, max_num_partitions), dtype=mx.float32
+    )
+    max_logits = mx.zeros(
+        (total_q_tokens, num_heads, max_num_partitions), dtype=mx.float32
+    )
+    tmp_out = mx.zeros(
+        (total_q_tokens, num_heads, max_num_partitions, kv_lora_rank),
+        dtype=q_nope.dtype,
+    )
+    mx.eval(exp_sums, max_logits, tmp_out)
+
+    ops = get_ops()
+    _ensure_mla_library(ops)
+    if q_nope.dtype == mx.bfloat16 and not mla_bf16_fa_available():
+        raise ValueError(
+            "MLA FA partitioned: bfloat16 inputs require native bfloat "
+            "support on the Metal device; see metal_mla_paged_attention_"
+            "decode_fa for details. Use float16, or wait for the routing "
+            "follow-up that picks an alternate route for bf16."
+        )
+    ops.mla_paged_attention_decode_fa_partitioned(
+        out,
+        exp_sums,
+        max_logits,
+        tmp_out,
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        block_size,
+        scale,
+        partition_size,
+        max_num_partitions,
+        use_wide,
+    )
+    mx.synchronize()
+
+
 def get_ops() -> ModuleType:
     """JIT-build and import the native paged_ops extension.
 
@@ -609,3 +846,15 @@ def _ensure_mla_library(mod: ModuleType) -> None:
     mod.init_mla_library(mla_src)
     _mla_library_initialized = True
     logger.info("MLA paged-attention Metal kernels loaded")
+
+
+def mla_bf16_fa_available() -> bool:
+    """Returns True if the bf16 FA kernels were instantiated in the loaded
+    paged_mla_kern library. Cached after the first probe. Initialises the
+    MLA library if needed."""
+    global _bf16_fa_available
+    if _bf16_fa_available is None:
+        ops = get_ops()
+        _ensure_mla_library(ops)
+        _bf16_fa_available = bool(ops.mla_has_bfloat_fa_kernel())
+    return _bf16_fa_available

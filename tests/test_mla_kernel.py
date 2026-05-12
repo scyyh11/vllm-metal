@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Direct unit tests for the MLA Metal kernel (RFC #360).
 
-Single-pass + split-K + 2pass decode kernels. The single-pass kernel
-handles ``ctx_len`` of any size that fits the caller-provided
+Single-pass + split-K + 2pass + FA decode kernels. The single-pass
+kernel handles ``ctx_len`` of any size that fits the caller-provided
 block_tables row; the partitioned (split-K) variant chunks ctx across
 multiple TGs and merges partials with the reduce kernel; the 2pass
-variant uses an MLX sdpa_vector_2pass-style cross-head amortized layout.
+variant uses an MLX sdpa_vector_2pass-style cross-head amortized layout;
+the FA variant uses ``simdgroup_matrix<T, 8, 8>`` MMAs over the same
+paged latent cache.
 """
 
 from __future__ import annotations
+
+import math
 
 import mlx.core as mx
 import numpy as np
@@ -18,8 +22,24 @@ from vllm_metal.metal import (
     MLA_PARTITION_SIZE,
     metal_mla_paged_attention,
     metal_mla_paged_attention_decode_2pass,
+    metal_mla_paged_attention_decode_fa,
+    metal_mla_paged_attention_decode_fa_partitioned,
     metal_mla_paged_attention_partitioned,
+    mla_bf16_fa_available,
 )
+
+
+def _skip_if_no_bf16_fa(dtype: mx.Dtype) -> None:
+    """Skip a bf16 FA test on devices without native bfloat support.
+    The bf16 FA kernels are gated at metallib compile time on such
+    devices (mla.metal `#if defined(__HAVE_BFLOAT__)`); the Python /
+    C++ wrappers reject bf16 FA calls up-front so callers do not hit a
+    raw `get_kernel` miss. Tests that parametrize over `dtype` should
+    call this at function entry to mark bf16 as `skipped` rather than
+    `failed` on those targets."""
+    if dtype == mx.bfloat16 and not mla_bf16_fa_available():
+        pytest.skip("bf16 FA kernels require native bfloat support on the Metal device")
+
 
 # Production shapes — only kv_lora_rank=512, qk_rope_head_dim=64 are
 # instantiated in mla.metal.
@@ -1314,6 +1334,826 @@ def test_mla_rejects_mixed_dtypes_decode_2pass() -> None:
             block_tables=btab,
             context_lens=ctx_lens,
             cu_seqlens_q=cu_q,
+            scale=0.125,
+        )
+
+
+# ============================================================
+# Paged FA decode kernel.
+# Single-block tests cover ctx == BK == 32 (one single-iter K-tile,
+# no multi-block online softmax). Multi-block tests cover the production
+# online-softmax merge path.
+# ============================================================
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_decode_fa_matches_dense_single_block(dtype: mx.Dtype) -> None:
+    """Stage 3a parity: B=1, H=8, ctx == BK == 16 (one page). Kernel's
+    QK + softmax + SV must match the dense reference within the
+    standard tolerance."""
+    _skip_if_no_bf16_fa(dtype)
+    block_size = 16
+    num_seqs = 1
+    num_heads = 8
+    ctx_len = 16  # == BK
+    n_blocks = ctx_len // block_size
+
+    mx.random.seed(7)
+    q_nope = mx.random.normal((num_seqs, num_heads, _KV_LORA_RANK)).astype(dtype)
+    q_pe = mx.random.normal((num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(dtype)
+    latent_cache = mx.random.normal((n_blocks, block_size, _LATENT_DIM)).astype(dtype)
+    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype)
+    block_tables = mx.array([[0]], dtype=mx.int32)
+    context_lens = mx.array([ctx_len], dtype=mx.uint32)
+    cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
+    scale = 1.0 / math.sqrt(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM)
+
+    metal_mla_paged_attention_decode_fa(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+    )
+    mx.eval(out)
+    assert bool(mx.all(mx.isfinite(out)).item())
+
+    # Dense reference: gather the two blocks into a contiguous
+    # [num_seqs, ctx_len, latent_dim] tensor, split kv_norm + k_pe,
+    # and run the same math the wrapper's slow path does.
+    flat = latent_cache.reshape(n_blocks * block_size, _LATENT_DIM)
+    gathered = flat[:ctx_len].reshape(num_seqs, ctx_len, _LATENT_DIM)
+    kv_norm = gathered[:, :, :_KV_LORA_RANK]
+    k_pe = gathered[:, :, _KV_LORA_RANK:]
+    expected = _absorbed_mla_dense_reference(
+        q_nope.astype(mx.float32),
+        q_pe.astype(mx.float32),
+        kv_norm.astype(mx.float32),
+        k_pe.astype(mx.float32),
+        scale,
+    ).astype(dtype)
+    mx.eval(expected)
+
+    rtol, atol = _tolerance(dtype)
+    max_abs = mx.max(
+        mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    ).item()
+    assert bool(mx.allclose(out, expected, rtol=rtol, atol=atol).item()), (
+        f"FA single-block mismatch (dtype={dtype}): max_abs_diff={max_abs:.5f}"
+    )
+
+
+def test_decode_fa_multi_head_group_and_multi_seq() -> None:
+    """Stage 3a parity at non-degenerate grid: 2 seqs × (H=16 → 2 head
+    groups) = 4 TGs. Catches grid-index swaps (seq vs head_group) and
+    cross-TG aliasing in the buffer indexing."""
+    block_size = 16
+    num_seqs = 2
+    num_heads = 16  # 2 head groups
+    ctx_len = 16
+    n_blocks = num_seqs  # one block per seq
+
+    mx.random.seed(19)
+    q_nope = mx.random.normal((num_seqs, num_heads, _KV_LORA_RANK)).astype(mx.float16)
+    q_pe = mx.random.normal((num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(mx.float16)
+    latent_cache = mx.random.normal((n_blocks, block_size, _LATENT_DIM)).astype(
+        mx.float16
+    )
+    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.float16)
+    block_tables = mx.array([[0], [1]], dtype=mx.int32)
+    context_lens = mx.array([ctx_len, ctx_len], dtype=mx.uint32)
+    cu_seqlens_q = mx.array([0, 1, 2], dtype=mx.int32)
+    scale = 1.0 / math.sqrt(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM)
+
+    metal_mla_paged_attention_decode_fa(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+    )
+    mx.eval(out)
+
+    # Per-seq dense reference.
+    flat = latent_cache.reshape(n_blocks * block_size, _LATENT_DIM)
+    kv_norm = mx.stack(
+        [
+            flat[i * block_size : (i + 1) * block_size, :_KV_LORA_RANK]
+            for i in range(num_seqs)
+        ],
+        axis=0,
+    )
+    k_pe = mx.stack(
+        [
+            flat[i * block_size : (i + 1) * block_size, _KV_LORA_RANK:]
+            for i in range(num_seqs)
+        ],
+        axis=0,
+    )
+    expected = _absorbed_mla_dense_reference(
+        q_nope.astype(mx.float32),
+        q_pe.astype(mx.float32),
+        kv_norm.astype(mx.float32),
+        k_pe.astype(mx.float32),
+        scale,
+    ).astype(mx.float16)
+    mx.eval(expected)
+
+    rtol, atol = _tolerance(mx.float16)
+    max_abs = mx.max(
+        mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    ).item()
+    assert bool(mx.allclose(out, expected, rtol=rtol, atol=atol).item()), (
+        f"FA multi-TG mismatch: max_abs_diff={max_abs:.5f}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("ctx_len", [24, 32, 64, 128])
+def test_decode_fa_matches_dense_multi_block(dtype: mx.Dtype, ctx_len: int) -> None:
+    """Stage 3b parity: multi-block ctx with online softmax merge across
+    K tiles. ``ctx_len`` choices cover both an exact-multiple of BK=16
+    (32, 64, 128) and a partial tail (24 → one full tile + 8 valid
+    cols in the second tile). The partial-tail case stresses the
+    in-kernel mask that zeroes out S cols beyond ctx_len."""
+    _skip_if_no_bf16_fa(dtype)
+    block_size = 16
+    num_seqs = 1
+    num_heads = 8
+    n_blocks = (ctx_len + block_size - 1) // block_size
+
+    mx.random.seed(101 + ctx_len)
+    q_nope = mx.random.normal((num_seqs, num_heads, _KV_LORA_RANK)).astype(dtype)
+    q_pe = mx.random.normal((num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(dtype)
+    latent_cache = mx.random.normal((n_blocks, block_size, _LATENT_DIM)).astype(dtype)
+    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype)
+    block_tables = mx.array([list(range(n_blocks))], dtype=mx.int32)
+    context_lens = mx.array([ctx_len], dtype=mx.uint32)
+    cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
+    scale = 1.0 / math.sqrt(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM)
+
+    metal_mla_paged_attention_decode_fa(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+    )
+    mx.eval(out)
+    assert bool(mx.all(mx.isfinite(out)).item())
+
+    flat = latent_cache.reshape(n_blocks * block_size, _LATENT_DIM)
+    gathered = flat[:ctx_len].reshape(num_seqs, ctx_len, _LATENT_DIM)
+    kv_norm = gathered[:, :, :_KV_LORA_RANK]
+    k_pe = gathered[:, :, _KV_LORA_RANK:]
+    expected = _absorbed_mla_dense_reference(
+        q_nope.astype(mx.float32),
+        q_pe.astype(mx.float32),
+        kv_norm.astype(mx.float32),
+        k_pe.astype(mx.float32),
+        scale,
+    ).astype(dtype)
+    mx.eval(expected)
+
+    rtol, atol = _tolerance(dtype)
+    max_abs = mx.max(
+        mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    ).item()
+    assert bool(mx.allclose(out, expected, rtol=rtol, atol=atol).item()), (
+        f"FA multi-block mismatch (dtype={dtype}, ctx={ctx_len}): max_abs_diff={max_abs:.5f}"
+    )
+
+
+@pytest.mark.parametrize("num_heads", [64, 128])
+def test_decode_fa_matches_dense_production_shape(num_heads: int) -> None:
+    """Stage 3b parity on the production grid: B=4 × H ∈ {64, 128} ×
+    ctx=2048, fp16. This is the cell where the sdpa_vector-style
+    kernels lose 0.4× to MLX (status doc §1.3) — getting parity here
+    means the FA kernel is ready for the Stage 4 bench."""
+    block_size = 16
+    num_seqs = 4
+    ctx_len = 2048
+    n_blocks_per_seq = ctx_len // block_size
+    n_blocks = n_blocks_per_seq * num_seqs
+
+    mx.random.seed(2048 + num_heads)
+    q_nope = mx.random.normal((num_seqs, num_heads, _KV_LORA_RANK)).astype(mx.float16)
+    q_pe = mx.random.normal((num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(mx.float16)
+    latent_cache = mx.random.normal((n_blocks, block_size, _LATENT_DIM)).astype(
+        mx.float16
+    )
+    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.float16)
+    bt_np = np.arange(n_blocks, dtype=np.int32).reshape(num_seqs, n_blocks_per_seq)
+    block_tables = mx.array(bt_np)
+    context_lens = mx.array([ctx_len] * num_seqs, dtype=mx.uint32)
+    cu_seqlens_q = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
+    scale = 1.0 / math.sqrt(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM)
+
+    metal_mla_paged_attention_decode_fa(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+    )
+    mx.eval(out)
+
+    # Per-seq reference.
+    outs = []
+    for i in range(num_seqs):
+        flat = mx.concatenate(
+            [latent_cache[int(bt_np[i, b])] for b in range(n_blocks_per_seq)],
+            axis=0,
+        )
+        kv_norm = flat[:, :_KV_LORA_RANK].reshape(1, ctx_len, _KV_LORA_RANK)
+        k_pe = flat[:, _KV_LORA_RANK:].reshape(1, ctx_len, _QK_ROPE_HEAD_DIM)
+        ref_i = _absorbed_mla_dense_reference(
+            q_nope[i : i + 1].astype(mx.float32),
+            q_pe[i : i + 1].astype(mx.float32),
+            kv_norm.astype(mx.float32),
+            k_pe.astype(mx.float32),
+            scale,
+        )
+        outs.append(ref_i)
+    expected = mx.concatenate(outs, axis=0).astype(mx.float16)
+    mx.eval(expected)
+
+    rtol, atol = _tolerance(mx.float16)
+    max_abs = mx.max(
+        mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    ).item()
+    assert bool(mx.allclose(out, expected, rtol=rtol, atol=atol).item()), (
+        f"FA production-shape mismatch (H={num_heads}, ctx={ctx_len}): "
+        f"max_abs_diff={max_abs:.5f}"
+    )
+
+
+def test_decode_fa_matches_dense_mixed_ctx_batch() -> None:
+    """Multi-seq batch with different ctx_lens per request. Confirms
+    that each TG reads its own seq's context_lens / block_tables row
+    independently and doesn't leak state across seqs. Padding entries
+    past each seq's valid blocks are set to -1 (0xFFFFFFFF on the
+    Metal uint32_t side) so any unclamped pbi -> OOB load on
+    latent_cache trips a GPU fault rather than silently aliasing to
+    block 0."""
+    block_size = 16
+    num_seqs = 3
+    num_heads = 8
+    ctx_lens = [16, 48, 24]
+    max_blocks = max((c + block_size - 1) // block_size for c in ctx_lens)
+    pool_blocks = sum((c + block_size - 1) // block_size for c in ctx_lens)
+
+    mx.random.seed(307)
+    q_nope = mx.random.normal((num_seqs, num_heads, _KV_LORA_RANK)).astype(mx.float16)
+    q_pe = mx.random.normal((num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(mx.float16)
+    latent_cache = mx.random.normal((pool_blocks, block_size, _LATENT_DIM)).astype(
+        mx.float16
+    )
+    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.float16)
+
+    # Pack block tables — each seq gets its own contiguous range, with
+    # padding entries past its valid blocks set to -1 to force the
+    # k_base_for clamp to use num_valid_blocks (not max_num_blocks_per_seq).
+    bt_np = np.full((num_seqs, max_blocks), -1, dtype=np.int32)
+    cursor = 0
+    for i, c in enumerate(ctx_lens):
+        n = (c + block_size - 1) // block_size
+        bt_np[i, :n] = np.arange(cursor, cursor + n)
+        cursor += n
+    block_tables = mx.array(bt_np)
+    context_lens = mx.array(ctx_lens, dtype=mx.uint32)
+    cu_seqlens_q = mx.array([0, 1, 2, 3], dtype=mx.int32)
+    scale = 1.0 / math.sqrt(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM)
+
+    metal_mla_paged_attention_decode_fa(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+    )
+    mx.eval(out)
+
+    # Per-seq reference (each seq has its own ctx_len, gathers its own blocks).
+    outs = []
+    for i, c in enumerate(ctx_lens):
+        n = (c + block_size - 1) // block_size
+        seq_blocks = mx.concatenate(
+            [latent_cache[int(bt_np[i, b])] for b in range(n)], axis=0
+        )[:c, :]
+        kv_norm = seq_blocks[:, :_KV_LORA_RANK].reshape(1, c, _KV_LORA_RANK)
+        k_pe = seq_blocks[:, _KV_LORA_RANK:].reshape(1, c, _QK_ROPE_HEAD_DIM)
+        ref_i = _absorbed_mla_dense_reference(
+            q_nope[i : i + 1].astype(mx.float32),
+            q_pe[i : i + 1].astype(mx.float32),
+            kv_norm.astype(mx.float32),
+            k_pe.astype(mx.float32),
+            scale,
+        )
+        outs.append(ref_i)
+    expected = mx.concatenate(outs, axis=0).astype(mx.float16)
+    mx.eval(expected)
+
+    rtol, atol = _tolerance(mx.float16)
+    max_abs = mx.max(
+        mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    ).item()
+    assert bool(mx.allclose(out, expected, rtol=rtol, atol=atol).item()), (
+        f"FA mixed-ctx mismatch: max_abs_diff={max_abs:.5f}"
+    )
+
+
+def test_decode_fa_indirect_block_tables() -> None:
+    """Block table points at a non-zero physical block. Catches absolute-
+    vs-relative block index bugs in the K loader."""
+    block_size = 16
+    num_seqs = 1
+    num_heads = 8
+    ctx_len = 16
+    num_blocks_pool = 8  # bigger than what the seq needs
+
+    mx.random.seed(31)
+    q_nope = mx.random.normal((num_seqs, num_heads, _KV_LORA_RANK)).astype(mx.float16)
+    q_pe = mx.random.normal((num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(mx.float16)
+    latent_cache = mx.random.normal((num_blocks_pool, block_size, _LATENT_DIM)).astype(
+        mx.float16
+    )
+    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.float16)
+    # Seq's logical block 0 lives at physical block 5.
+    block_tables = mx.array([[5]], dtype=mx.int32)
+    context_lens = mx.array([ctx_len], dtype=mx.uint32)
+    cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
+    scale = 1.0 / math.sqrt(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM)
+
+    metal_mla_paged_attention_decode_fa(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+    )
+    mx.eval(out)
+
+    # Reference reads from physical block 5.
+    referenced = latent_cache[5].reshape(1, block_size, _LATENT_DIM)
+    kv_norm = referenced[:, :, :_KV_LORA_RANK]
+    k_pe = referenced[:, :, _KV_LORA_RANK:]
+    expected = _absorbed_mla_dense_reference(
+        q_nope.astype(mx.float32),
+        q_pe.astype(mx.float32),
+        kv_norm.astype(mx.float32),
+        k_pe.astype(mx.float32),
+        scale,
+    ).astype(mx.float16)
+    mx.eval(expected)
+
+    rtol, atol = _tolerance(mx.float16)
+    max_abs = mx.max(
+        mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    ).item()
+    assert bool(mx.allclose(out, expected, rtol=rtol, atol=atol).item()), (
+        f"FA indirect block_tables mismatch: max_abs_diff={max_abs:.5f}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "ctx_len,partition_size",
+    [(64, 64), (128, 64), (256, 128), (2048, 128), (4096, 512)],
+)
+def test_decode_fa_partitioned_matches_dense(
+    dtype: mx.Dtype, ctx_len: int, partition_size: int
+) -> None:
+    """Stage 6.2 parity: partitioned FA + reduce kernel chain matches
+    the dense reference. Cells span:
+    - ctx=64, ps=64 (single partition)
+    - ctx=128, ps=64 (2 partitions)
+    - ctx=256, ps=128 (2 partitions)
+    - ctx=2048, ps=128 (16 partitions — main long-ctx target)
+    - ctx=4096, ps=512 (8 partitions, sanity at production scale)
+    """
+    _skip_if_no_bf16_fa(dtype)
+    block_size = 16
+    num_seqs = 1
+    num_heads = 8
+    n_blocks = (ctx_len + block_size - 1) // block_size
+
+    mx.random.seed(401 + ctx_len + partition_size)
+    q_nope = mx.random.normal((num_seqs, num_heads, _KV_LORA_RANK)).astype(dtype)
+    q_pe = mx.random.normal((num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(dtype)
+    latent_cache = mx.random.normal((n_blocks, block_size, _LATENT_DIM)).astype(dtype)
+    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype)
+    block_tables = mx.array([list(range(n_blocks))], dtype=mx.int32)
+    context_lens = mx.array([ctx_len], dtype=mx.uint32)
+    cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
+    scale = 1.0 / math.sqrt(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM)
+
+    metal_mla_paged_attention_decode_fa_partitioned(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+        partition_size=partition_size,
+    )
+    mx.eval(out)
+    assert bool(mx.all(mx.isfinite(out)).item())
+
+    flat = latent_cache.reshape(n_blocks * block_size, _LATENT_DIM)
+    gathered = flat[:ctx_len].reshape(num_seqs, ctx_len, _LATENT_DIM)
+    kv_norm = gathered[:, :, :_KV_LORA_RANK]
+    k_pe = gathered[:, :, _KV_LORA_RANK:]
+    expected = _absorbed_mla_dense_reference(
+        q_nope.astype(mx.float32),
+        q_pe.astype(mx.float32),
+        kv_norm.astype(mx.float32),
+        k_pe.astype(mx.float32),
+        scale,
+    ).astype(dtype)
+    mx.eval(expected)
+
+    rtol, atol = _tolerance(dtype)
+    max_abs = mx.max(
+        mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    ).item()
+    assert bool(mx.allclose(out, expected, rtol=rtol, atol=atol).item()), (
+        f"FA partitioned mismatch (dtype={dtype}, ctx={ctx_len}, ps={partition_size}): "
+        f"max_abs_diff={max_abs:.5f}"
+    )
+
+
+def test_decode_fa_partitioned_matches_non_partitioned() -> None:
+    """The partitioned FA + reduce chain must produce numerically
+    equivalent output to the non-partitioned FA on the same input
+    (within numerical noise from the partition-then-merge softmax)."""
+    block_size = 16
+    num_seqs = 2
+    num_heads = 16
+    ctx_len = 512
+    n_blocks_per_seq = (ctx_len + block_size - 1) // block_size
+    n_blocks = n_blocks_per_seq * num_seqs
+
+    mx.random.seed(509)
+    q_nope = mx.random.normal((num_seqs, num_heads, _KV_LORA_RANK)).astype(mx.float16)
+    q_pe = mx.random.normal((num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(mx.float16)
+    latent_cache = mx.random.normal((n_blocks, block_size, _LATENT_DIM)).astype(
+        mx.float16
+    )
+    bt_np = np.arange(n_blocks, dtype=np.int32).reshape(num_seqs, n_blocks_per_seq)
+    block_tables = mx.array(bt_np)
+    context_lens = mx.array([ctx_len] * num_seqs, dtype=mx.uint32)
+    cu_seqlens_q = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
+    scale = 1.0 / math.sqrt(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM)
+
+    out_partitioned = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.float16)
+    metal_mla_paged_attention_decode_fa_partitioned(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out_partitioned,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+        partition_size=128,
+    )
+
+    out_non_partitioned = mx.zeros(
+        (num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.float16
+    )
+    metal_mla_paged_attention_decode_fa(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out_non_partitioned,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+    )
+
+    mx.eval(out_partitioned, out_non_partitioned)
+    rtol, atol = _tolerance(mx.float16)
+    max_abs = mx.max(
+        mx.abs(
+            out_partitioned.astype(mx.float32) - out_non_partitioned.astype(mx.float32)
+        )
+    ).item()
+    assert bool(
+        mx.allclose(out_partitioned, out_non_partitioned, rtol=rtol, atol=atol).item()
+    ), f"FA partitioned vs non-partitioned mismatch: max_abs_diff={max_abs:.5f}"
+
+
+def test_decode_fa_partitioned_mixed_ctx_with_poison_padding() -> None:
+    """Partitioned FA counterpart to test_decode_fa_matches_dense_mixed_ctx_batch:
+    different ctx_lens per request, block_tables padded with -1 past each
+    seq's valid blocks. Exercises the partitioned k_base_for clamp — an
+    unclamped pbi would dereference 0xFFFFFFFF as a physical-block index
+    and OOB load on latent_cache."""
+    block_size = 16
+    num_seqs = 3
+    num_heads = 8
+    ctx_lens = [64, 192, 128]
+    partition_size = 64
+    max_blocks = max((c + block_size - 1) // block_size for c in ctx_lens)
+    pool_blocks = sum((c + block_size - 1) // block_size for c in ctx_lens)
+
+    mx.random.seed(613)
+    q_nope = mx.random.normal((num_seqs, num_heads, _KV_LORA_RANK)).astype(mx.float16)
+    q_pe = mx.random.normal((num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(mx.float16)
+    latent_cache = mx.random.normal((pool_blocks, block_size, _LATENT_DIM)).astype(
+        mx.float16
+    )
+    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.float16)
+
+    bt_np = np.full((num_seqs, max_blocks), -1, dtype=np.int32)
+    cursor = 0
+    for i, c in enumerate(ctx_lens):
+        n = (c + block_size - 1) // block_size
+        bt_np[i, :n] = np.arange(cursor, cursor + n)
+        cursor += n
+    block_tables = mx.array(bt_np)
+    context_lens = mx.array(ctx_lens, dtype=mx.uint32)
+    cu_seqlens_q = mx.array([0, 1, 2, 3], dtype=mx.int32)
+    scale = 1.0 / math.sqrt(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM)
+
+    metal_mla_paged_attention_decode_fa_partitioned(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+        partition_size=partition_size,
+    )
+    mx.eval(out)
+    assert bool(mx.all(mx.isfinite(out)).item())
+
+    outs = []
+    for i, c in enumerate(ctx_lens):
+        n = (c + block_size - 1) // block_size
+        seq_blocks = mx.concatenate(
+            [latent_cache[int(bt_np[i, b])] for b in range(n)], axis=0
+        )[:c, :]
+        kv_norm = seq_blocks[:, :_KV_LORA_RANK].reshape(1, c, _KV_LORA_RANK)
+        k_pe = seq_blocks[:, _KV_LORA_RANK:].reshape(1, c, _QK_ROPE_HEAD_DIM)
+        ref_i = _absorbed_mla_dense_reference(
+            q_nope[i : i + 1].astype(mx.float32),
+            q_pe[i : i + 1].astype(mx.float32),
+            kv_norm.astype(mx.float32),
+            k_pe.astype(mx.float32),
+            scale,
+        )
+        outs.append(ref_i)
+    expected = mx.concatenate(outs, axis=0).astype(mx.float16)
+    mx.eval(expected)
+
+    rtol, atol = _tolerance(mx.float16)
+    max_abs = mx.max(
+        mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    ).item()
+    assert bool(mx.allclose(out, expected, rtol=rtol, atol=atol).item()), (
+        f"FA partitioned mixed-ctx (poison padding) mismatch: "
+        f"max_abs_diff={max_abs:.5f}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "num_heads,ctx_len",
+    [
+        (8, 128),  # short ctx, single head_group
+        (16, 512),  # short ctx boundary
+        (16, 2048),  # long ctx
+        (40, 1024),  # MiniCPM3 H + mid ctx
+        (96, 2048),  # GLM-full H + long ctx
+        (128, 2048),  # DeepSeek H + long ctx
+    ],
+)
+def test_decode_fa_wide_matches_narrow(
+    num_heads: int, ctx_len: int, dtype: mx.Dtype
+) -> None:
+    """The wide (BK=64, WN=8) FA instantiation must match the narrow
+    (BK=32, WN=4) anchor across the production grid. Output equivalence
+    within fp16/bf16 noise — the two tile shapes process the same SV
+    math, just with different per-iter K throughput."""
+    _skip_if_no_bf16_fa(dtype)
+    block_size = 16
+    num_seqs = 2
+    n_blocks_per_seq = (ctx_len + block_size - 1) // block_size
+    n_blocks = n_blocks_per_seq * num_seqs
+
+    mx.random.seed(1117)
+    q_nope = mx.random.normal((num_seqs, num_heads, _KV_LORA_RANK)).astype(dtype)
+    q_pe = mx.random.normal((num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(dtype)
+    latent_cache = mx.random.normal((n_blocks, block_size, _LATENT_DIM)).astype(dtype)
+    bt_np = np.arange(n_blocks, dtype=np.int32).reshape(num_seqs, n_blocks_per_seq)
+    block_tables = mx.array(bt_np)
+    context_lens = mx.array([ctx_len] * num_seqs, dtype=mx.uint32)
+    cu_seqlens_q = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
+    scale = 1.0 / math.sqrt(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM)
+
+    out_narrow = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype)
+    metal_mla_paged_attention_decode_fa(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out_narrow,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+        use_wide=False,
+    )
+    out_wide = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype)
+    metal_mla_paged_attention_decode_fa(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out_wide,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+        use_wide=True,
+    )
+    mx.eval(out_narrow, out_wide)
+    rtol, atol = _tolerance(dtype)
+    max_abs = mx.max(
+        mx.abs(out_narrow.astype(mx.float32) - out_wide.astype(mx.float32))
+    ).item()
+    assert bool(mx.allclose(out_narrow, out_wide, rtol=rtol, atol=atol).item()), (
+        f"FA wide vs narrow mismatch: max_abs_diff={max_abs:.5f}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "num_heads,ctx_len,partition_size",
+    [
+        (16, 512, 128),
+        (16, 2048, 128),
+        (96, 4096, 512),
+        (128, 2048, 128),
+    ],
+)
+def test_decode_fa_partitioned_wide_matches_narrow(
+    num_heads: int, ctx_len: int, partition_size: int, dtype: mx.Dtype
+) -> None:
+    """Partitioned FA wide (BK=64/WN=8) vs narrow (BK=32/WN=4) parity.
+    Reduce kernel is shared so the only diff is per-partition tile
+    shape; output should match within reduction-merge noise."""
+    _skip_if_no_bf16_fa(dtype)
+    block_size = 16
+    num_seqs = 2
+    n_blocks_per_seq = (ctx_len + block_size - 1) // block_size
+    n_blocks = n_blocks_per_seq * num_seqs
+
+    mx.random.seed(2222)
+    q_nope = mx.random.normal((num_seqs, num_heads, _KV_LORA_RANK)).astype(dtype)
+    q_pe = mx.random.normal((num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(dtype)
+    latent_cache = mx.random.normal((n_blocks, block_size, _LATENT_DIM)).astype(dtype)
+    bt_np = np.arange(n_blocks, dtype=np.int32).reshape(num_seqs, n_blocks_per_seq)
+    block_tables = mx.array(bt_np)
+    context_lens = mx.array([ctx_len] * num_seqs, dtype=mx.uint32)
+    cu_seqlens_q = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
+    scale = 1.0 / math.sqrt(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM)
+
+    out_narrow = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype)
+    metal_mla_paged_attention_decode_fa_partitioned(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out_narrow,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+        partition_size=partition_size,
+        use_wide=False,
+    )
+    out_wide = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype)
+    metal_mla_paged_attention_decode_fa_partitioned(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out_wide,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=scale,
+        partition_size=partition_size,
+        use_wide=True,
+    )
+    mx.eval(out_narrow, out_wide)
+    rtol, atol = _tolerance(dtype)
+    max_abs = mx.max(
+        mx.abs(out_narrow.astype(mx.float32) - out_wide.astype(mx.float32))
+    ).item()
+    assert bool(mx.allclose(out_narrow, out_wide, rtol=rtol, atol=atol).item()), (
+        f"FA partitioned wide vs narrow mismatch: max_abs_diff={max_abs:.5f}"
+    )
+
+
+def test_decode_fa_partitioned_rejects_unsupported_partition_size() -> None:
+    """FA partitioned only instantiates ps ∈ {64, 128, 512}. Caller
+    passing ps=256 (which is an MLA 2pass-supported size, easy to
+    confuse) must be rejected at the Python wrapper with a clear error
+    rather than slipping through to a C++ `get_kernel` miss."""
+    block_size = 16
+    num_seqs = 1
+    num_heads = 8
+    ctx_len = 64
+    q_nope = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.float16)
+    q_pe = mx.zeros((num_seqs, num_heads, _QK_ROPE_HEAD_DIM), dtype=mx.float16)
+    latent_cache = mx.zeros((1, block_size, _LATENT_DIM), dtype=mx.float16)
+    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.float16)
+    block_tables = mx.zeros((num_seqs, 4), dtype=mx.int32)
+    context_lens = mx.array([ctx_len], dtype=mx.uint32)
+    cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
+    with pytest.raises(ValueError, match="partition_size must be in"):
+        metal_mla_paged_attention_decode_fa_partitioned(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            latent_cache=latent_cache,
+            out=out,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            scale=0.125,
+            partition_size=256,  # not in _MLA_DECODE_FA_PARTITION_SIZES
+        )
+
+
+def test_decode_fa_rejects_unsupported_num_heads() -> None:
+    """``num_heads`` not a multiple of BQ=8 must raise — the kernel has
+    no partial-tile handling along the M axis."""
+    block_size = 16
+    q_nope = mx.zeros((1, 7, _KV_LORA_RANK), dtype=mx.float16)
+    q_pe = mx.zeros((1, 7, _QK_ROPE_HEAD_DIM), dtype=mx.float16)
+    latent_cache = mx.zeros((1, block_size, _LATENT_DIM), dtype=mx.float16)
+    out = mx.zeros((1, 7, _KV_LORA_RANK), dtype=mx.float16)
+    block_tables = mx.zeros((1, 1), dtype=mx.int32)
+    context_lens = mx.array([block_size], dtype=mx.uint32)
+    cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
+
+    with pytest.raises(ValueError, match="multiple of 8"):
+        metal_mla_paged_attention_decode_fa(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            latent_cache=latent_cache,
+            out=out,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            scale=0.125,
+        )
+
+
+def test_decode_fa_rejects_multi_token_query() -> None:
+    """Same decode-only contract as the other MLA kernels."""
+    block_size = 16
+    q_nope = mx.zeros((2, 8, _KV_LORA_RANK), dtype=mx.float16)
+    q_pe = mx.zeros((2, 8, _QK_ROPE_HEAD_DIM), dtype=mx.float16)
+    latent_cache = mx.zeros((1, block_size, _LATENT_DIM), dtype=mx.float16)
+    out = mx.zeros((2, 8, _KV_LORA_RANK), dtype=mx.float16)
+    block_tables = mx.zeros((1, 1), dtype=mx.int32)
+    context_lens = mx.array([block_size], dtype=mx.uint32)
+    # Single request with 2 query tokens — fails the cu_seqlens delta=1 check.
+    cu_seqlens_q = mx.array([0, 2], dtype=mx.int32)
+
+    with pytest.raises(NotImplementedError, match="decode only"):
+        metal_mla_paged_attention_decode_fa(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            latent_cache=latent_cache,
+            out=out,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            cu_seqlens_q=cu_seqlens_q,
             scale=0.125,
         )
 

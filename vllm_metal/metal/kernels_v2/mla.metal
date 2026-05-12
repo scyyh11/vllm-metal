@@ -713,6 +713,639 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
   }
 }
 
+// ========================================== Paged FA decode kernel
+//
+// simdgroup_matrix-based paged FA kernel.
+// Multi-block ctx with online softmax merged across BK tiles: each
+// outer iteration loads BK K-tokens, computes one QK tile, merges its
+// row_max / row_sum into the persistent state, rescales the V
+// accumulators by `factor = exp(old_max - new_max)`, and accumulates
+// the SV contribution. Partial tail (last K tile with valid_cols <
+// BK) is handled by setting out-of-range S cols to -INF before
+// softmax and to 0 in S_smem before the SV pass.
+//
+// Threadgroup geometry: WM × WN × 32 = WN × 32 threads (WM=1). One TG
+// owns one (seq, head_group) tile of BQ consecutive query heads. The
+// WN simdgroups partition the N axis of QK (each owns an 8-token tile
+// of S) and the D axis of SV (each owns 1/WN of KV_LORA_RANK in V_accum).
+//
+// Buffer layout (mirrors single-pass paged_mla_attention sans the
+// partitioning-only buffers):
+//   0: out          [total_q_tokens, num_heads, KV_LORA_RANK] T
+//   1: q_nope       [total_q_tokens, num_heads, KV_LORA_RANK] T
+//   2: q_pe         [total_q_tokens, num_heads, QK_ROPE_HEAD_DIM] T
+//   3: latent_cache [num_blocks, BLOCK_SIZE, KV_LORA_RANK + QK_ROPE_HEAD_DIM] T
+//   4: block_tables [num_seqs, max_num_blocks_per_seq] uint32
+//   5: context_lens [num_seqs] uint32
+//   6: cu_seqlens_q [num_seqs + 1] int32 (decode-only host-side validation)
+//   7: max_num_blocks_per_seq (constant int)
+//   8: num_heads_total          (constant int)
+//   9: scale (constant float)
+
+template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
+          int BQ, int BK, int WM, int WN>
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
+paged_mla_attention_decode_fa(
+    device T *out [[buffer(0)]],
+    device const T *q_nope [[buffer(1)]],
+    device const T *q_pe [[buffer(2)]],
+    device const T *latent_cache [[buffer(3)]],
+    device const uint32_t *block_tables [[buffer(4)]],
+    device const uint32_t *context_lens [[buffer(5)]],
+    device const int32_t *cu_seqlens_q [[buffer(6)]],
+    const constant int &max_num_blocks_per_seq [[buffer(7)]],
+    const constant int &num_heads_total [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(BQ == 8, "FA decode supports BQ=8 (one simdgroup_matrix M).");
+  static_assert(BK % 8 == 0, "BK must be a multiple of the 8x8 frag size.");
+  static_assert(KV_LORA_RANK % 8 == 0,
+                "KV_LORA_RANK must divide the 8-wide D tile.");
+  static_assert(QK_ROPE_HEAD_DIM % 8 == 0,
+                "QK_ROPE_HEAD_DIM must divide the 8-wide D tile.");
+  static_assert(BK % WN == 0,
+                "WN simdgroups partition BK along N; BK must be divisible by WN.");
+  static_assert(KV_LORA_RANK % (WN * 8) == 0,
+                "WN simdgroups partition KV_LORA_RANK along D in V_accum; "
+                "KV_LORA_RANK must be divisible by WN * 8.");
+  static_assert(WN <= BQ,
+                "Softmax assigns BQ rows to WN simdgroups (BQ / WN per group).");
+  // cu_seqlens_q is host-side validated.
+  (void)cu_seqlens_q;
+
+  constexpr int LATENT_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+  constexpr int FRAG = 8;
+  constexpr int THREADS_PER_TG = WM * WN * 32;
+  // Q is the only buffer that pays off in shmem: it's loaded once and
+  // read 72 times per outer block iter. K_smem at BK=32 would overflow
+  // Apple's 32 KB per-TG cap, so K is streamed directly from device
+  // memory via simdgroup_load. Each TG's K reads hit L2 from sibling
+  // head-group TGs servicing the same (seq, K) pair, so the working
+  // set is amortized across head_groups within a TG launch.
+  constexpr int PAD_T = 16 / sizeof(T);
+  constexpr int LD_Q = LATENT_DIM + PAD_T;
+  constexpr int LD_S = BK + FRAG;  // fp32, padded by one frag width
+
+  constexpr int D_NOPE_TILES = KV_LORA_RANK / FRAG;
+  constexpr int D_PE_TILES = QK_ROPE_HEAD_DIM / FRAG;
+  constexpr int D_TILES = D_NOPE_TILES + D_PE_TILES;
+  constexpr int K_TILES = BK / FRAG;
+  // Each simdgroup owns 1/WN of KV_LORA_RANK in V_accum.
+  constexpr int V_TILES_PER_SG = KV_LORA_RANK / FRAG / WN;
+  // Rows handled by each simdgroup during the softmax phase.
+  constexpr int ROWS_PER_SG = BQ / WN;
+  static_assert(ROWS_PER_SG >= 1, "Need at least 1 softmax row per simdgroup.");
+  // Softmax distributes one row's BK columns across the 32 lanes of a
+  // simdgroup; each lane handles BK_CHUNKS columns (at BK=32 one chunk
+  // covers the row; at BK=64 each lane sweeps two strided columns).
+  constexpr int LANES_PER_CHUNK = 32;
+  constexpr int BK_CHUNKS = (BK + LANES_PER_CHUNK - 1) / LANES_PER_CHUNK;
+  static_assert(BK <= LANES_PER_CHUNK * 2,
+                "Softmax fast-path supports BK ≤ 64 (≤ 2 chunks per lane).");
+
+  threadgroup T Q_smem[BQ * LD_Q];
+  threadgroup float S_smem[BQ * LD_S];
+  threadgroup float row_max_smem[BQ];
+  threadgroup float row_sum_smem[BQ];
+  threadgroup float factor_smem[BQ];
+
+  const int tid = simd_gid * 32 + simd_lid;
+
+  const int seq_idx = (int)threadgroup_position_in_grid.x;
+  const int head_group_idx = (int)threadgroup_position_in_grid.y;
+  const int q_head_offset = head_group_idx * BQ;
+  if (q_head_offset >= num_heads_total) {
+    return;
+  }
+
+  const int ctx_len = (int)context_lens[seq_idx];
+  if (ctx_len <= 0) {
+    return;
+  }
+
+  // ===== Load Q into shmem (pre-scaled) =====
+  const device T *q_nope_base =
+      q_nope +
+      (uint64_t)(seq_idx * num_heads_total + q_head_offset) * KV_LORA_RANK;
+  const device T *q_pe_base =
+      q_pe +
+      (uint64_t)(seq_idx * num_heads_total + q_head_offset) * QK_ROPE_HEAD_DIM;
+  for (int idx = tid; idx < BQ * LATENT_DIM; idx += THREADS_PER_TG) {
+    const int row = idx / LATENT_DIM;
+    const int col = idx % LATENT_DIM;
+    const int head = q_head_offset + row;
+    float v;
+    if (head < num_heads_total) {
+      if (col < KV_LORA_RANK) {
+        v = float(q_nope_base[row * KV_LORA_RANK + col]) * scale;
+      } else {
+        v = float(q_pe_base[row * QK_ROPE_HEAD_DIM + (col - KV_LORA_RANK)]) *
+            scale;
+      }
+    } else {
+      v = 0.0f;
+    }
+    Q_smem[row * LD_Q + col] = T(v);
+  }
+
+  // ===== Init running softmax state =====
+  if (tid < BQ) {
+    row_max_smem[tid] = -INFINITY;
+    row_sum_smem[tid] = 0.0f;
+  }
+
+  // ===== Init V accumulators (persistent across blocks) =====
+  simdgroup_matrix<float, FRAG, FRAG> V_accum[V_TILES_PER_SG];
+  for (int vt = 0; vt < V_TILES_PER_SG; vt++) {
+    V_accum[vt] = simdgroup_matrix<float, FRAG, FRAG>(0.0f);
+  }
+
+  const device uint32_t *block_table_row =
+      block_tables + (uint64_t)seq_idx * max_num_blocks_per_seq;
+  const int num_k_blocks = (ctx_len + BK - 1) / BK;
+  // Clamp pbi against *this* seq's valid blocks, not max_num_blocks_per_seq.
+  // Otherwise a mixed-length batch reads padded block_tables entries for
+  // the simdgroup slice that lands past ctx_len (softmax masks the result
+  // to zero, but the OOB load itself is undefined behaviour).
+  const int num_valid_blocks = (ctx_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+  // BaseMMAFrag lane → (row, col) layout. Each lane owns 2 elements at
+  // (fm, fn) and (fm, fn+1) in any 8x8 simdgroup_matrix tile we touch.
+  const short qid = simd_lid / 4;
+  const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+  const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+
+  // Helper: device-pointer for an 8-token K-frag starting at absolute
+  // token index `abs_k`. pbi is clamped to `num_valid_blocks - 1` so we
+  // never dereference a padded block_tables entry, even when the column
+  // is later masked to zero by the softmax.
+  auto k_base_for = [&](int abs_k) -> const device T * {
+    const int pbi_raw = abs_k / BLOCK_SIZE;
+    const int pbi = pbi_raw < num_valid_blocks ? pbi_raw : num_valid_blocks - 1;
+    const int offset = abs_k % BLOCK_SIZE;
+    const uint32_t pb = block_table_row[pbi];
+    return latent_cache + (uint64_t)pb * BLOCK_SIZE * LATENT_DIM +
+           (uint64_t)offset * LATENT_DIM;
+  };
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // ===== Block loop =====
+  for (int kb = 0; kb < num_k_blocks; kb++) {
+    const int k_global_start = kb * BK;
+    const int k_global_end = min(k_global_start + BK, ctx_len);
+    const int valid_cols = k_global_end - k_global_start;
+
+    // ----- QK matmul (K_frag streamed from device) -----
+    // Each simdgroup owns one 8-token slice of S. The 8 tokens are
+    // guaranteed to share a single physical block: BK ≤ 2 × block_size
+    // here, but the per-simdgroup slice is exactly FRAG=8 ≤ block_size.
+    simdgroup_matrix<float, FRAG, FRAG> S_tile(0.0f);
+    const int qk_local_k_start = simd_gid * FRAG;
+    const int qk_abs_k_start = k_global_start + qk_local_k_start;
+    const device T *qk_k_base = k_base_for(qk_abs_k_start);
+    for (int d_tile = 0; d_tile < D_TILES; d_tile++) {
+      const int d_start = d_tile * FRAG;
+      simdgroup_matrix<T, FRAG, FRAG> Q_frag;
+      simdgroup_matrix<T, FRAG, FRAG> K_frag;
+      simdgroup_load(Q_frag, &Q_smem[d_start], LD_Q);
+      // K device layout is (BK rows of K-tokens × LATENT_DIM); transpose
+      // gives the (D, K_tokens) view simdgroup_multiply_accumulate wants
+      // for B in C = A * B + D.
+      simdgroup_load(K_frag, qk_k_base + d_start, LATENT_DIM, ulong2(0, 0),
+                     /*transpose=*/true);
+      simdgroup_multiply_accumulate(S_tile, Q_frag, K_frag, S_tile);
+    }
+
+    // Dump S to shmem so all simdgroups can softmax row-wise across BK.
+    simdgroup_store(S_tile, &S_smem[qk_local_k_start], LD_S);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ----- Online softmax merge across blocks -----
+    // Each simdgroup owns ROWS_PER_SG rows. Within a row, the BK
+    // columns are split across the 32 lanes in BK_CHUNKS strided
+    // groups (BK_CHUNKS=1 at BK=32, BK_CHUNKS=2 at BK=64). simd_max
+    // and simd_sum reduce across the 32 lanes; the local_x / exp_x
+    // arrays carry each lane's chunk values across the two passes.
+    for (int local_row = 0; local_row < ROWS_PER_SG; local_row++) {
+      const int r = simd_gid * ROWS_PER_SG + local_row;
+
+      float local_x[BK_CHUNKS];
+      float local_max = -INFINITY;
+      for (int c = 0; c < BK_CHUNKS; c++) {
+        const int col = c * LANES_PER_CHUNK + (int)simd_lid;
+        const bool col_in_block = (col < BK);
+        const bool col_in_ctx = col_in_block && (col < valid_cols);
+        const float x_raw =
+            col_in_block ? S_smem[r * LD_S + col] : -INFINITY;
+        const float x = col_in_ctx ? x_raw : -INFINITY;
+        local_x[c] = x;
+        local_max = max(local_max, x);
+      }
+      const float block_max = simd_max(local_max);
+      const float old_max = row_max_smem[r];
+      const float new_max = max(old_max, block_max);
+      const float factor =
+          (old_max == -INFINITY) ? 0.0f : fast::exp(old_max - new_max);
+
+      float exp_x[BK_CHUNKS];
+      float local_sum = 0.0f;
+      for (int c = 0; c < BK_CHUNKS; c++) {
+        const int col = c * LANES_PER_CHUNK + (int)simd_lid;
+        const bool col_in_ctx = (col < BK) && (col < valid_cols);
+        exp_x[c] = col_in_ctx ? fast::exp(local_x[c] - new_max) : 0.0f;
+        local_sum += exp_x[c];
+      }
+      const float block_sum = simd_sum(local_sum);
+      const float new_sum = row_sum_smem[r] * factor + block_sum;
+
+      for (int c = 0; c < BK_CHUNKS; c++) {
+        const int col = c * LANES_PER_CHUNK + (int)simd_lid;
+        if (col < BK) {
+          S_smem[r * LD_S + col] = exp_x[c];
+        }
+      }
+      if (simd_lid == 0) {
+        factor_smem[r] = factor;
+        row_max_smem[r] = new_max;
+        row_sum_smem[r] = new_sum;
+      }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ----- Rescale V_accum by per-row factor -----
+    const float factor_for_lane = factor_smem[fm];
+    for (int vt = 0; vt < V_TILES_PER_SG; vt++) {
+      V_accum[vt].thread_elements()[0] *= factor_for_lane;
+      V_accum[vt].thread_elements()[1] *= factor_for_lane;
+    }
+
+    // ----- SV matmul: V_accum += softmaxed_S @ V (V streamed from device) -----
+    // Each simdgroup spans the full BK on the K-axis, so V is read
+    // K_TILES times. The K-tile starts cross block boundaries when
+    // BK > BLOCK_SIZE; one device pointer per K-tile, hoisted out of
+    // the V-tile inner loop.
+    //
+    // Loop order is (vt outer, kt inner) by experiment — swapping kt
+    // outermost regresses 20-35% at long ctx. The original order keeps
+    // the same 32 K-token rows resident across all V_TILES_PER_SG D
+    // tiles per vt (warm L1/L2 reuse), which outweighs the savings
+    // from hoisting the S_frag load out of the inner loop. Pre-loading
+    // S_frag into registers (vt-outer order preserved) is neutral —
+    // S_smem reads were already hidden behind V loads + MAC.
+    const device T *v_k_base[K_TILES];
+    for (int kt = 0; kt < K_TILES; kt++) {
+      v_k_base[kt] = k_base_for(k_global_start + kt * FRAG);
+    }
+    for (int vt = 0; vt < V_TILES_PER_SG; vt++) {
+      const int d_start = (simd_gid * V_TILES_PER_SG + vt) * FRAG;
+      for (int kt = 0; kt < K_TILES; kt++) {
+        const int k_inner = kt * FRAG;
+        simdgroup_matrix<float, FRAG, FRAG> S_frag;
+        simdgroup_matrix<T, FRAG, FRAG> V_frag;
+        simdgroup_load(S_frag, &S_smem[k_inner], LD_S);
+        // V_frag wants (K_tokens, D) — non-transposed. V == kv_norm
+        // is the first KV_LORA_RANK cols of latent_cache rows.
+        simdgroup_load(V_frag, v_k_base[kt] + d_start, LATENT_DIM);
+        simdgroup_multiply_accumulate(V_accum[vt], S_frag, V_frag, V_accum[vt]);
+      }
+    }
+
+    // Simdgroups in a TG advance independently. SV reads S_smem; the
+    // next iter's QK writes S_smem (via simdgroup_store of the new
+    // S_tile). Without this barrier, a fast simdgroup can clobber
+    // S_smem before a slow one finishes the SV multiply on the prior
+    // iter's S values — non-deterministic / wrong output at ctx > BK.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // ===== Final normalize and write =====
+  const int head = q_head_offset + fm;
+  if (head < num_heads_total) {
+    const float inv_sum =
+        (row_sum_smem[fm] > 0.0f) ? (1.0f / row_sum_smem[fm]) : 0.0f;
+    device T *out_row =
+        out + (uint64_t)(seq_idx * num_heads_total + head) * KV_LORA_RANK;
+    for (int vt = 0; vt < V_TILES_PER_SG; vt++) {
+      const int d_start = (simd_gid * V_TILES_PER_SG + vt) * FRAG;
+      out_row[d_start + fn] =
+          T(float(V_accum[vt].thread_elements()[0]) * inv_sum);
+      out_row[d_start + fn + 1] =
+          T(float(V_accum[vt].thread_elements()[1]) * inv_sum);
+    }
+  }
+}
+
+// ========================================== Partitioned FA decode kernel
+//
+// Split-K + reduce variant of the FA decode kernel for long-ctx
+// workloads. Same inner pipeline as
+// `paged_mla_attention_decode_fa`, but each TG processes a single
+// PARTITION_SIZE slice of the K axis and writes (max, sum, normalized
+// partial) to scratch buffers that the existing
+// `paged_mla_attention_reduce` kernel merges across partitions.
+//
+// Grid: (num_seqs, num_head_groups, num_partitions).
+//
+// Buffer layout (matches metal_mla_paged_attention_decode_2pass):
+//   0: exp_sums    [num_seqs, num_heads, num_partitions]                       fp32
+//   1: max_logits  [num_seqs, num_heads, num_partitions]                       fp32
+//   2: tmp_out     [num_seqs, num_heads, num_partitions, KV_LORA_RANK]         T
+//   3: q_nope      [total_q_tokens, num_heads, KV_LORA_RANK]                   T
+//   4: q_pe        [total_q_tokens, num_heads, QK_ROPE_HEAD_DIM]               T
+//   5: latent_cache [num_blocks, BLOCK_SIZE, KV_LORA_RANK+QK_ROPE_HEAD_DIM]    T
+//   6: block_tables [num_seqs, max_num_blocks_per_seq]                         uint32
+//   7: context_lens [num_seqs]                                                 uint32
+//   8: max_num_blocks_per_seq                                                  constant int
+//   9: num_heads_total                                                         constant int
+//  10: scale                                                                   constant float
+
+template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
+          int BQ, int BK, int WM, int WN, int PARTITION_SIZE>
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
+paged_mla_attention_decode_fa_partitioned(
+    device float *exp_sums [[buffer(0)]],
+    device float *max_logits [[buffer(1)]],
+    device T *tmp_out [[buffer(2)]],
+    device const T *q_nope [[buffer(3)]],
+    device const T *q_pe [[buffer(4)]],
+    device const T *latent_cache [[buffer(5)]],
+    device const uint32_t *block_tables [[buffer(6)]],
+    device const uint32_t *context_lens [[buffer(7)]],
+    const constant int &max_num_blocks_per_seq [[buffer(8)]],
+    const constant int &num_heads_total [[buffer(9)]],
+    const constant float &scale [[buffer(10)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(BQ == 8, "FA partitioned decode supports BQ=8.");
+  static_assert(BK % 8 == 0, "BK must be a multiple of the 8x8 frag size.");
+  static_assert(KV_LORA_RANK % 8 == 0,
+                "KV_LORA_RANK must divide the 8-wide D tile.");
+  static_assert(QK_ROPE_HEAD_DIM % 8 == 0,
+                "QK_ROPE_HEAD_DIM must divide the 8-wide D tile.");
+  static_assert(BK % WN == 0,
+                "WN simdgroups partition BK along N; BK must be divisible by WN.");
+  static_assert(KV_LORA_RANK % (WN * 8) == 0,
+                "WN simdgroups partition KV_LORA_RANK along D in V_accum.");
+  static_assert(WN <= BQ,
+                "Softmax assigns BQ rows to WN simdgroups (BQ / WN per group).");
+  static_assert(PARTITION_SIZE % BK == 0,
+                "PARTITION_SIZE must be a multiple of BK.");
+
+  constexpr int LATENT_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+  constexpr int FRAG = 8;
+  constexpr int THREADS_PER_TG = WM * WN * 32;
+  constexpr int PAD_T = 16 / sizeof(T);
+  constexpr int LD_Q = LATENT_DIM + PAD_T;
+  constexpr int LD_S = BK + FRAG;
+  constexpr int D_NOPE_TILES = KV_LORA_RANK / FRAG;
+  constexpr int D_PE_TILES = QK_ROPE_HEAD_DIM / FRAG;
+  constexpr int D_TILES = D_NOPE_TILES + D_PE_TILES;
+  constexpr int K_TILES = BK / FRAG;
+  constexpr int V_TILES_PER_SG = KV_LORA_RANK / FRAG / WN;
+  constexpr int ROWS_PER_SG = BQ / WN;
+  static_assert(ROWS_PER_SG >= 1, "Need at least 1 softmax row per simdgroup.");
+  // Softmax distributes one row's BK columns across the 32 lanes of a
+  // simdgroup; each lane handles BK_CHUNKS columns — see decode_fa.
+  constexpr int LANES_PER_CHUNK = 32;
+  constexpr int BK_CHUNKS = (BK + LANES_PER_CHUNK - 1) / LANES_PER_CHUNK;
+  static_assert(BK <= LANES_PER_CHUNK * 2,
+                "Softmax fast-path supports BK ≤ 64 (≤ 2 chunks per lane).");
+
+  threadgroup T Q_smem[BQ * LD_Q];
+  threadgroup float S_smem[BQ * LD_S];
+  threadgroup float row_max_smem[BQ];
+  threadgroup float row_sum_smem[BQ];
+  threadgroup float factor_smem[BQ];
+
+  const int tid = simd_gid * 32 + simd_lid;
+
+  const int seq_idx = (int)threadgroup_position_in_grid.x;
+  const int head_group_idx = (int)threadgroup_position_in_grid.y;
+  const int partition_idx = (int)threadgroup_position_in_grid.z;
+  const int num_partitions = (int)threadgroups_per_grid.z;
+  const int q_head_offset = head_group_idx * BQ;
+  if (q_head_offset >= num_heads_total) {
+    return;
+  }
+
+  const int ctx_len = (int)context_lens[seq_idx];
+  const int p_start = partition_idx * PARTITION_SIZE;
+  const int p_end = min(p_start + PARTITION_SIZE, ctx_len);
+
+  // Empty partition: emit -INF/0 sentinels so the reduce kernel sees a
+  // zero-contribution partial. Caller is expected to zero-init tmp_out
+  // (Python entry does), so we only need to write the bookkeeping.
+  if (p_start >= ctx_len) {
+    if (simd_gid == 0 && simd_lid < BQ) {
+      const int head = q_head_offset + simd_lid;
+      if (head < num_heads_total) {
+        const uint64_t bookkeep =
+            (uint64_t)(seq_idx * num_heads_total + head) * num_partitions +
+            (uint64_t)partition_idx;
+        max_logits[bookkeep] = -INFINITY;
+        exp_sums[bookkeep] = 0.0f;
+      }
+    }
+    return;
+  }
+
+  // ===== Load Q into shmem (pre-scaled) =====
+  const device T *q_nope_base =
+      q_nope +
+      (uint64_t)(seq_idx * num_heads_total + q_head_offset) * KV_LORA_RANK;
+  const device T *q_pe_base =
+      q_pe +
+      (uint64_t)(seq_idx * num_heads_total + q_head_offset) * QK_ROPE_HEAD_DIM;
+  for (int idx = tid; idx < BQ * LATENT_DIM; idx += THREADS_PER_TG) {
+    const int row = idx / LATENT_DIM;
+    const int col = idx % LATENT_DIM;
+    const int head = q_head_offset + row;
+    float v;
+    if (head < num_heads_total) {
+      if (col < KV_LORA_RANK) {
+        v = float(q_nope_base[row * KV_LORA_RANK + col]) * scale;
+      } else {
+        v = float(q_pe_base[row * QK_ROPE_HEAD_DIM + (col - KV_LORA_RANK)]) *
+            scale;
+      }
+    } else {
+      v = 0.0f;
+    }
+    Q_smem[row * LD_Q + col] = T(v);
+  }
+
+  if (tid < BQ) {
+    row_max_smem[tid] = -INFINITY;
+    row_sum_smem[tid] = 0.0f;
+  }
+
+  simdgroup_matrix<float, FRAG, FRAG> V_accum[V_TILES_PER_SG];
+  for (int vt = 0; vt < V_TILES_PER_SG; vt++) {
+    V_accum[vt] = simdgroup_matrix<float, FRAG, FRAG>(0.0f);
+  }
+
+  const device uint32_t *block_table_row =
+      block_tables + (uint64_t)seq_idx * max_num_blocks_per_seq;
+  const int num_k_blocks = (p_end - p_start + BK - 1) / BK;
+  // Same rationale as non-partitioned FA: clamp pbi against *this* seq's
+  // valid blocks (not max_num_blocks_per_seq) to avoid OOB loads on
+  // padded block_tables entries in mixed-length batches.
+  const int num_valid_blocks = (ctx_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+  const short qid = simd_lid / 4;
+  const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+  const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+
+  auto k_base_for = [&](int abs_k) -> const device T * {
+    const int pbi_raw = abs_k / BLOCK_SIZE;
+    const int pbi = pbi_raw < num_valid_blocks ? pbi_raw : num_valid_blocks - 1;
+    const int offset = abs_k % BLOCK_SIZE;
+    const uint32_t pb = block_table_row[pbi];
+    return latent_cache + (uint64_t)pb * BLOCK_SIZE * LATENT_DIM +
+           (uint64_t)offset * LATENT_DIM;
+  };
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int kb = 0; kb < num_k_blocks; kb++) {
+    const int k_global_start = p_start + kb * BK;
+    const int k_global_end = min(k_global_start + BK, p_end);
+    const int valid_cols = k_global_end - k_global_start;
+
+    simdgroup_matrix<float, FRAG, FRAG> S_tile(0.0f);
+    const int qk_local_k_start = simd_gid * FRAG;
+    const int qk_abs_k_start = k_global_start + qk_local_k_start;
+    const device T *qk_k_base = k_base_for(qk_abs_k_start);
+    for (int d_tile = 0; d_tile < D_TILES; d_tile++) {
+      const int d_start = d_tile * FRAG;
+      simdgroup_matrix<T, FRAG, FRAG> Q_frag;
+      simdgroup_matrix<T, FRAG, FRAG> K_frag;
+      simdgroup_load(Q_frag, &Q_smem[d_start], LD_Q);
+      simdgroup_load(K_frag, qk_k_base + d_start, LATENT_DIM, ulong2(0, 0),
+                     /*transpose=*/true);
+      simdgroup_multiply_accumulate(S_tile, Q_frag, K_frag, S_tile);
+    }
+
+    simdgroup_store(S_tile, &S_smem[qk_local_k_start], LD_S);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // BK_CHUNKS-strided softmax — see decode_fa for the rationale.
+    for (int local_row = 0; local_row < ROWS_PER_SG; local_row++) {
+      const int r = simd_gid * ROWS_PER_SG + local_row;
+
+      float local_x[BK_CHUNKS];
+      float local_max = -INFINITY;
+      for (int c = 0; c < BK_CHUNKS; c++) {
+        const int col = c * LANES_PER_CHUNK + (int)simd_lid;
+        const bool col_in_block = (col < BK);
+        const bool col_in_ctx = col_in_block && (col < valid_cols);
+        const float x_raw =
+            col_in_block ? S_smem[r * LD_S + col] : -INFINITY;
+        const float x = col_in_ctx ? x_raw : -INFINITY;
+        local_x[c] = x;
+        local_max = max(local_max, x);
+      }
+      const float block_max = simd_max(local_max);
+      const float old_max = row_max_smem[r];
+      const float new_max = max(old_max, block_max);
+      const float factor =
+          (old_max == -INFINITY) ? 0.0f : fast::exp(old_max - new_max);
+
+      float exp_x[BK_CHUNKS];
+      float local_sum = 0.0f;
+      for (int c = 0; c < BK_CHUNKS; c++) {
+        const int col = c * LANES_PER_CHUNK + (int)simd_lid;
+        const bool col_in_ctx = (col < BK) && (col < valid_cols);
+        exp_x[c] = col_in_ctx ? fast::exp(local_x[c] - new_max) : 0.0f;
+        local_sum += exp_x[c];
+      }
+      const float block_sum = simd_sum(local_sum);
+      const float new_sum = row_sum_smem[r] * factor + block_sum;
+
+      for (int c = 0; c < BK_CHUNKS; c++) {
+        const int col = c * LANES_PER_CHUNK + (int)simd_lid;
+        if (col < BK) {
+          S_smem[r * LD_S + col] = exp_x[c];
+        }
+      }
+      if (simd_lid == 0) {
+        factor_smem[r] = factor;
+        row_max_smem[r] = new_max;
+        row_sum_smem[r] = new_sum;
+      }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float factor_for_lane = factor_smem[fm];
+    for (int vt = 0; vt < V_TILES_PER_SG; vt++) {
+      V_accum[vt].thread_elements()[0] *= factor_for_lane;
+      V_accum[vt].thread_elements()[1] *= factor_for_lane;
+    }
+
+    const device T *v_k_base[K_TILES];
+    for (int kt = 0; kt < K_TILES; kt++) {
+      v_k_base[kt] = k_base_for(k_global_start + kt * FRAG);
+    }
+    for (int vt = 0; vt < V_TILES_PER_SG; vt++) {
+      const int d_start = (simd_gid * V_TILES_PER_SG + vt) * FRAG;
+      for (int kt = 0; kt < K_TILES; kt++) {
+        const int k_inner = kt * FRAG;
+        simdgroup_matrix<float, FRAG, FRAG> S_frag;
+        simdgroup_matrix<T, FRAG, FRAG> V_frag;
+        simdgroup_load(S_frag, &S_smem[k_inner], LD_S);
+        simdgroup_load(V_frag, v_k_base[kt] + d_start, LATENT_DIM);
+        simdgroup_multiply_accumulate(V_accum[vt], S_frag, V_frag, V_accum[vt]);
+      }
+    }
+
+    // See decode_fa: SV reads S_smem; next iter's QK writes S_smem.
+    // Barrier prevents a fast simdgroup from clobbering S_smem mid-SV.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // ===== Write per-partition (max, sum, normalized_partial) =====
+  // Lane assignment: each lane owns 2 elements at (fm, fn), (fm, fn+1)
+  // in each V_accum tile. inv_sum is per-row (per head) — read from
+  // row_sum_smem[fm].
+  const int head = q_head_offset + fm;
+  if (head < num_heads_total) {
+    const float inv_sum =
+        (row_sum_smem[fm] > 0.0f) ? (1.0f / row_sum_smem[fm]) : 0.0f;
+    const uint64_t tmp_base =
+        (uint64_t)(seq_idx * num_heads_total + head) * num_partitions *
+            KV_LORA_RANK +
+        (uint64_t)partition_idx * KV_LORA_RANK;
+    for (int vt = 0; vt < V_TILES_PER_SG; vt++) {
+      const int d_start = (simd_gid * V_TILES_PER_SG + vt) * FRAG;
+      tmp_out[tmp_base + d_start + fn] =
+          T(float(V_accum[vt].thread_elements()[0]) * inv_sum);
+      tmp_out[tmp_base + d_start + fn + 1] =
+          T(float(V_accum[vt].thread_elements()[1]) * inv_sum);
+    }
+  }
+
+  // One lane per head writes (max, sum) bookkeeping.
+  if (simd_gid == 0 && simd_lid < BQ) {
+    const int hd = q_head_offset + simd_lid;
+    if (hd < num_heads_total) {
+      const uint64_t bookkeep =
+          (uint64_t)(seq_idx * num_heads_total + hd) * num_partitions +
+          (uint64_t)partition_idx;
+      max_logits[bookkeep] = row_max_smem[simd_lid];
+      exp_sums[bookkeep] = row_sum_smem[simd_lid];
+    }
+  }
+}
+
+
 // ========================================== Instantiations
 //
 // Single-pass main kernel: dtype × block_size × heads_per_tg × partition_size.
@@ -875,3 +1508,106 @@ instantiate_mla_reduce(half, 512, 256);
 instantiate_mla_reduce(bfloat16_t, 512, 64);
 instantiate_mla_reduce(bfloat16_t, 512, 128);
 instantiate_mla_reduce(bfloat16_t, 512, 256);
+
+// Paged FA decode kernel.
+// Tile anchor: BQ=8, BK=32, WM=1, WN=4 → 128 threads/TG. Single
+// instantiation per (dtype, block_size); additional tile variants are
+// instantiated below when routing needs them.
+#define instantiate_mla_fa(type, kv_lora_rank, qk_rope_head_dim, block_size,   \
+                           bq, bk, wm, wn)                                     \
+  template [[host_name("paged_mla_attention_decode_fa_" #type "_kvr"           \
+                       #kv_lora_rank "_pe" #qk_rope_head_dim "_bs"             \
+                       #block_size "_bq" #bq "_bk" #bk "_wm" #wm "_wn"         \
+                       #wn)]] [[kernel]] void                                  \
+  paged_mla_attention_decode_fa<type, kv_lora_rank, qk_rope_head_dim,          \
+                                block_size, bq, bk, wm, wn>(                   \
+      device type * out [[buffer(0)]],                                         \
+      device const type *q_nope [[buffer(1)]],                                 \
+      device const type *q_pe [[buffer(2)]],                                   \
+      device const type *latent_cache [[buffer(3)]],                           \
+      device const uint32_t *block_tables [[buffer(4)]],                       \
+      device const uint32_t *context_lens [[buffer(5)]],                       \
+      device const int32_t *cu_seqlens_q [[buffer(6)]],                        \
+      const constant int &max_num_blocks_per_seq [[buffer(7)]],                \
+      const constant int &num_heads_total [[buffer(8)]],                       \
+      const constant float &scale [[buffer(9)]],                               \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                        \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+// Tile anchor: BQ=8, BK=32, WM=1, WN=4 → 128 threads/TG. Stage 6.1
+// drops K_smem (would overflow Apple's 32 KB per-TG cap at BK=32) and
+// streams K from device via simdgroup_load. WN=4 matches
+// BK / FRAG = 32/8 = 4
+// N-tiles so every simdgroup has QK work, and halves V_TILES_PER_SG
+// from 32 → 16, easing register pressure on V_accum.
+instantiate_mla_fa(half, 512, 64, 16, 8, 32, 1, 4);
+// FA's simdgroup_matrix<T> / simdgroup_multiply_accumulate intrinsics need
+// native bfloat support — on targets where __HAVE_BFLOAT__ is undefined,
+// MLX falls back to a struct _MLX_BFloat16 that the MMA path can't accept,
+// and instantiating these kernels would fail the whole paged_mla_kern
+// library compile (taking the fp16 paths down with them).
+#if defined(__HAVE_BFLOAT__)
+instantiate_mla_fa(bfloat16_t, 512, 64, 16, 8, 32, 1, 4);
+#endif
+
+// Wide variant: BQ=8, BK=64, WM=1, WN=8 → 256 threads/TG. Halves
+// the outer block count again vs BK=32 (doubles the per-iter K
+// streamed) and doubles the per-TG simdgroup count. V_TILES_PER_SG
+// drops to 8 (was 16), trading register pressure for more concurrent
+// V streams. ROWS_PER_SG = 1 (was 2) — each simdgroup softmaxes one
+// row, with BK_CHUNKS=2 lanes processing the 64 columns.
+instantiate_mla_fa(half, 512, 64, 16, 8, 64, 1, 8);
+#if defined(__HAVE_BFLOAT__)
+instantiate_mla_fa(bfloat16_t, 512, 64, 16, 8, 64, 1, 8);
+#endif
+
+// Partitioned FA — split-K + reduce variant for long-ctx workloads.
+#define instantiate_mla_fa_part(type, kv_lora_rank, qk_rope_head_dim,           \
+                                block_size, bq, bk, wm, wn, ps)                 \
+  template [[host_name("paged_mla_attention_decode_fa_partitioned_" #type       \
+                       "_kvr" #kv_lora_rank "_pe" #qk_rope_head_dim "_bs"       \
+                       #block_size "_bq" #bq "_bk" #bk "_wm" #wm "_wn" #wn      \
+                       "_ps" #ps)]] [[kernel]] void                             \
+  paged_mla_attention_decode_fa_partitioned<type, kv_lora_rank,                 \
+                                            qk_rope_head_dim, block_size, bq,   \
+                                            bk, wm, wn, ps>(                    \
+      device float *exp_sums [[buffer(0)]],                                     \
+      device float *max_logits [[buffer(1)]],                                   \
+      device type *tmp_out [[buffer(2)]],                                       \
+      device const type *q_nope [[buffer(3)]],                                  \
+      device const type *q_pe [[buffer(4)]],                                    \
+      device const type *latent_cache [[buffer(5)]],                            \
+      device const uint32_t *block_tables [[buffer(6)]],                        \
+      device const uint32_t *context_lens [[buffer(7)]],                        \
+      const constant int &max_num_blocks_per_seq [[buffer(8)]],                 \
+      const constant int &num_heads_total [[buffer(9)]],                        \
+      const constant float &scale [[buffer(10)]],                               \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],      \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                    \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                         \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+// Partition sizes mirror metal_mla_paged_attention_decode_2pass:
+// ps=64 for ctx≤1024, ps=128 for ctx>1024; ps=512 kept for long ctx.
+instantiate_mla_fa_part(half, 512, 64, 16, 8, 32, 1, 4, 64);
+instantiate_mla_fa_part(half, 512, 64, 16, 8, 32, 1, 4, 128);
+instantiate_mla_fa_part(half, 512, 64, 16, 8, 32, 1, 4, 512);
+// Bfloat FA partitioned — same native-bfloat requirement as the
+// non-partitioned FA kernel above.
+#if defined(__HAVE_BFLOAT__)
+instantiate_mla_fa_part(bfloat16_t, 512, 64, 16, 8, 32, 1, 4, 64);
+instantiate_mla_fa_part(bfloat16_t, 512, 64, 16, 8, 32, 1, 4, 128);
+instantiate_mla_fa_part(bfloat16_t, 512, 64, 16, 8, 32, 1, 4, 512);
+#endif
+
+// Wide variant: BK=64, WN=8 — see decode_fa wide variant comment.
+// Partition sizes restricted to those divisible by BK=64.
+instantiate_mla_fa_part(half, 512, 64, 16, 8, 64, 1, 8, 64);
+instantiate_mla_fa_part(half, 512, 64, 16, 8, 64, 1, 8, 128);
+instantiate_mla_fa_part(half, 512, 64, 16, 8, 64, 1, 8, 512);
+#if defined(__HAVE_BFLOAT__)
+instantiate_mla_fa_part(bfloat16_t, 512, 64, 16, 8, 64, 1, 8, 64);
+instantiate_mla_fa_part(bfloat16_t, 512, 64, 16, 8, 64, 1, 8, 128);
+instantiate_mla_fa_part(bfloat16_t, 512, 64, 16, 8, 64, 1, 8, 512);
+#endif

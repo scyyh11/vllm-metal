@@ -1075,6 +1075,32 @@ void init_mla_library(const std::string& src) {
   d.get_library("paged_mla_kern", [&]() { return mla_source_; });
 }
 
+// Runtime probe: are the bf16 FA kernel instantiations present in the
+// loaded paged_mla_kern library? On targets without native bfloat
+// (__HAVE_BFLOAT__ undefined), mla.metal gates the bfloat16_t FA
+// instantiations away because simdgroup_matrix<T> cannot accept MLX's
+// fallback _MLX_BFloat16 struct, so any bf16 FA call would otherwise
+// trip get_kernel deep inside dispatch. Cached after the first probe.
+// Caller is expected to have invoked init_mla_library beforehand.
+bool mla_has_bfloat_fa_kernel() {
+  static bool checked = false;
+  static bool available = false;
+  if (checked) return available;
+  auto& d = metal::device(Device::gpu);
+  auto* lib = d.get_library("paged_mla_kern");
+  try {
+    // Probe one bf16 FA kernel name (narrow tile variant).
+    d.get_kernel(
+        "paged_mla_attention_decode_fa_bfloat16_t_kvr512_pe64_bs16_bq8_bk32_wm1_wn4",
+        lib);
+    available = true;
+  } catch (...) {
+    available = false;
+  }
+  checked = true;
+  return available;
+}
+
 // Dispatch the MLA paged attention kernel.
 //
 // Buffer slot map (must match kernels_v2/mla.metal):
@@ -1776,6 +1802,336 @@ void mla_paged_attention_decode_2pass_impl(
       max_num_partitions, default_stream(Device::gpu));
 }
 
+// Paged FA decode kernel.
+// Tile anchor: BQ=8, BK=32, WM=1, WN=4 → 128 threads/TG. The body
+// reads/writes the same paged latent cache as the single-pass and
+// 2pass kernels; wide/narrow tile variants differ only in BK/WN.
+//
+// `use_wide` selects the alternate (BQ=8, BK=64, WM=1, WN=8 → 256
+// threads/TG) instantiation that halves V_TILES_PER_SG and doubles
+// per-iter K throughput.
+static void dispatch_mla_paged_attention_decode_fa(
+    array& out,
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    const array& cu_seqlens_q,
+    int block_size,
+    float scale,
+    bool use_wide,
+    Stream s,
+    bool from_primitive = false) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(q_nope.shape(0));
+  int num_heads = static_cast<int>(q_nope.shape(1));
+  int kv_lora_rank = static_cast<int>(q_nope.shape(2));
+  int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
+  int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+
+  // Tile shape — see decode_fa wide variant comment in mla.metal.
+  // BK=32/WN=4 is the narrow anchor; BK=64/WN=8 is the wide variant.
+  const int BQ = 8;
+  const int BK = use_wide ? 64 : 32;
+  const int WM = 1;
+  const int WN = use_wide ? 8 : 4;
+  const int THREADS_PER_TG = WM * WN * 32;
+
+  if (kv_lora_rank != 512) {
+    throw std::runtime_error(
+        "MLA FA decode kernel: only kv_lora_rank=512 is instantiated; got " +
+        std::to_string(kv_lora_rank));
+  }
+  if (qk_rope_head_dim != 64) {
+    throw std::runtime_error(
+        "MLA FA decode kernel: only qk_rope_head_dim=64 is instantiated; got " +
+        std::to_string(qk_rope_head_dim));
+  }
+  if (block_size != 16) {
+    throw std::runtime_error(
+        "MLA FA decode kernel: only block_size=16 is instantiated; got " +
+        std::to_string(block_size));
+  }
+  if (num_heads % BQ != 0) {
+    throw std::runtime_error(
+        "MLA FA decode kernel: num_heads (" + std::to_string(num_heads) +
+        ") must be a multiple of BQ=" + std::to_string(BQ));
+  }
+  mla_validate_t_dtypes("MLA FA decode kernel", {
+      {"q_nope", &q_nope},
+      {"q_pe", &q_pe},
+      {"latent_cache", &latent_cache},
+      {"out", &out},
+  });
+
+  int num_head_groups = num_heads / BQ;
+
+  auto dt = dtype_to_metal(q_nope.dtype());
+  if (dt == "bfloat16_t" && !mla_has_bfloat_fa_kernel()) {
+    throw std::runtime_error(
+        "MLA FA decode kernel: bfloat16 is not supported on this Metal "
+        "device — bf16 FA instantiations are gated on native bfloat "
+        "(__HAVE_BFLOAT__) and the running device falls back to a "
+        "struct representation incompatible with simdgroup_matrix. Use "
+        "float16, or wait for the routing follow-up that picks an "
+        "alternate route for bf16.");
+  }
+  std::string kname = "paged_mla_attention_decode_fa_" + dt + "_kvr" +
+                      std::to_string(kv_lora_rank) + "_pe" +
+                      std::to_string(qk_rope_head_dim) + "_bs" +
+                      std::to_string(block_size) + "_bq" + std::to_string(BQ) +
+                      "_bk" + std::to_string(BK) + "_wm" + std::to_string(WM) +
+                      "_wn" + std::to_string(WN);
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_output_array(out, 0);
+  enc.set_input_array(q_nope, 1);
+  enc.set_input_array(q_pe, 2);
+  enc.set_input_array(latent_cache, 3);
+  enc.set_input_array(block_tables, 4);
+  enc.set_input_array(context_lens, 5);
+  enc.set_input_array(cu_seqlens_q, 6);
+
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  int32_t num_heads_i = static_cast<int32_t>(num_heads);
+  enc.set_bytes(max_blocks_i, 7);
+  enc.set_bytes(num_heads_i, 8);
+  enc.set_bytes(scale, 9);
+
+  // Grid: (total_q_tokens, num_head_groups, 1). Threads/TG = WN * 32
+  // (WM=1 collapses the M-axis simdgroup dim).
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(total_q_tokens, num_head_groups, 1),
+      MTL::Size::Make(THREADS_PER_TG, 1, 1));
+
+  if (!from_primitive) {
+    add_temporary_compat(enc, out, d, s);
+    add_temporary_compat(enc, q_nope, d, s);
+    add_temporary_compat(enc, q_pe, d, s);
+    add_temporary_compat(enc, latent_cache, d, s);
+    add_temporary_compat(enc, block_tables, d, s);
+    add_temporary_compat(enc, context_lens, d, s);
+    add_temporary_compat(enc, cu_seqlens_q, d, s);
+  }
+}
+
+// Partitioned FA decode kernel.
+// Same per-partition pipeline as dispatch_mla_paged_attention_decode_fa
+// above, but each TG handles one PARTITION_SIZE slice of ctx and writes
+// (max, sum, normalized partial). The existing
+// paged_mla_attention_reduce kernel does the cross-partition merge —
+// same contract as decode_2pass.
+static void dispatch_mla_paged_attention_decode_fa_partitioned(
+    array& out,
+    array& exp_sums,
+    array& max_logits,
+    array& tmp_out,
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    bool use_wide,
+    Stream s,
+    bool from_primitive = false) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(q_nope.shape(0));
+  int num_heads = static_cast<int>(q_nope.shape(1));
+  int kv_lora_rank = static_cast<int>(q_nope.shape(2));
+  int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
+  int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+
+  // See decode_fa wide variant comment in mla.metal.
+  const int BQ = 8;
+  const int BK = use_wide ? 64 : 32;
+  const int WM = 1;
+  const int WN = use_wide ? 8 : 4;
+  const int THREADS_PER_TG = WM * WN * 32;
+
+  if (kv_lora_rank != 512) {
+    throw std::runtime_error(
+        "MLA FA partitioned kernel: only kv_lora_rank=512 is instantiated; "
+        "got " +
+        std::to_string(kv_lora_rank));
+  }
+  if (qk_rope_head_dim != 64) {
+    throw std::runtime_error(
+        "MLA FA partitioned kernel: only qk_rope_head_dim=64 is instantiated; "
+        "got " +
+        std::to_string(qk_rope_head_dim));
+  }
+  if (block_size != 16) {
+    throw std::runtime_error(
+        "MLA FA partitioned kernel: only block_size=16 is instantiated; got " +
+        std::to_string(block_size));
+  }
+  if (partition_size != 64 && partition_size != 128 && partition_size != 512) {
+    throw std::runtime_error(
+        "MLA FA partitioned kernel: partition_size must be in {64, 128, 512}; "
+        "got " +
+        std::to_string(partition_size));
+  }
+  if (num_heads % BQ != 0) {
+    throw std::runtime_error(
+        "MLA FA partitioned kernel: num_heads (" + std::to_string(num_heads) +
+        ") must be a multiple of BQ=" + std::to_string(BQ));
+  }
+  mla_validate_t_dtypes("MLA FA partitioned kernel", {
+      {"q_nope", &q_nope},
+      {"q_pe", &q_pe},
+      {"latent_cache", &latent_cache},
+      {"out", &out},
+      {"tmp_out", &tmp_out},
+  });
+
+  int num_head_groups = num_heads / BQ;
+
+  auto dt = dtype_to_metal(q_nope.dtype());
+  if (dt == "bfloat16_t" && !mla_has_bfloat_fa_kernel()) {
+    throw std::runtime_error(
+        "MLA FA partitioned kernel: bfloat16 is not supported on this "
+        "Metal device — see dispatch_mla_paged_attention_decode_fa for "
+        "details. Use float16, or wait for the routing follow-up.");
+  }
+  std::string kname =
+      "paged_mla_attention_decode_fa_partitioned_" + dt + "_kvr" +
+      std::to_string(kv_lora_rank) + "_pe" + std::to_string(qk_rope_head_dim) +
+      "_bs" + std::to_string(block_size) + "_bq" + std::to_string(BQ) + "_bk" +
+      std::to_string(BK) + "_wm" + std::to_string(WM) + "_wn" +
+      std::to_string(WN) + "_ps" + std::to_string(partition_size);
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  enc.set_output_array(tmp_out, 2);
+  enc.set_input_array(q_nope, 3);
+  enc.set_input_array(q_pe, 4);
+  enc.set_input_array(latent_cache, 5);
+  enc.set_input_array(block_tables, 6);
+  enc.set_input_array(context_lens, 7);
+
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  int32_t num_heads_i = static_cast<int32_t>(num_heads);
+  enc.set_bytes(max_blocks_i, 8);
+  enc.set_bytes(num_heads_i, 9);
+  enc.set_bytes(scale, 10);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(total_q_tokens, num_head_groups, max_num_partitions),
+      MTL::Size::Make(THREADS_PER_TG, 1, 1));
+
+  // Reuse the same reduce kernel as 2pass — same partial contract.
+  constexpr int REDUCE_NUM_THREADS = 256;
+  constexpr int REDUCE_NUM_WARPS = REDUCE_NUM_THREADS / 32;
+  std::string reduce_kname = "paged_mla_attention_reduce_" + dt + "_hs" +
+                             std::to_string(kv_lora_rank) + "_nt256_nsl32_ps" +
+                             std::to_string(partition_size);
+  auto* reduce_kernel = d.get_kernel(reduce_kname, lib, reduce_kname, {});
+
+  size_t reduce_shmem = static_cast<size_t>(
+      (2 * max_num_partitions + 2 * REDUCE_NUM_WARPS) * sizeof(float));
+
+  enc.set_compute_pipeline_state(reduce_kernel);
+  enc.set_threadgroup_memory_length(reduce_shmem, 0);
+
+  enc.set_output_array(out, 0);
+  enc.set_input_array(exp_sums, 1);
+  enc.set_input_array(max_logits, 2);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(context_lens, 4);
+  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+  enc.set_bytes(max_num_partitions_i, 5);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(REDUCE_NUM_THREADS, 1, 1));
+
+  if (!from_primitive) {
+    add_temporary_compat(enc, out, d, s);
+    add_temporary_compat(enc, exp_sums, d, s);
+    add_temporary_compat(enc, max_logits, d, s);
+    add_temporary_compat(enc, tmp_out, d, s);
+    add_temporary_compat(enc, q_nope, d, s);
+    add_temporary_compat(enc, q_pe, d, s);
+    add_temporary_compat(enc, latent_cache, d, s);
+    add_temporary_compat(enc, block_tables, d, s);
+    add_temporary_compat(enc, context_lens, d, s);
+  }
+}
+
+
+void mla_paged_attention_decode_fa_partitioned_impl(
+    nb::handle out_h,
+    nb::handle exp_sums_h,
+    nb::handle max_logits_h,
+    nb::handle tmp_out_h,
+    nb::handle q_nope_h,
+    nb::handle q_pe_h,
+    nb::handle latent_cache_h,
+    nb::handle block_tables_h,
+    nb::handle context_lens_h,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    bool use_wide) {
+  auto& out = *nb::inst_ptr<array>(out_h);
+  auto& exp_sums = *nb::inst_ptr<array>(exp_sums_h);
+  auto& max_logits = *nb::inst_ptr<array>(max_logits_h);
+  auto& tmp_out = *nb::inst_ptr<array>(tmp_out_h);
+  auto& q_nope = *nb::inst_ptr<array>(q_nope_h);
+  auto& q_pe = *nb::inst_ptr<array>(q_pe_h);
+  auto& latent_cache = *nb::inst_ptr<array>(latent_cache_h);
+  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
+  auto& context_lens = *nb::inst_ptr<array>(context_lens_h);
+
+  dispatch_mla_paged_attention_decode_fa_partitioned(
+      out, exp_sums, max_logits, tmp_out, q_nope, q_pe, latent_cache,
+      block_tables, context_lens, block_size, scale, partition_size,
+      max_num_partitions, use_wide, default_stream(Device::gpu));
+}
+
+void mla_paged_attention_decode_fa_impl(
+    nb::handle out_h,
+    nb::handle q_nope_h,
+    nb::handle q_pe_h,
+    nb::handle latent_cache_h,
+    nb::handle block_tables_h,
+    nb::handle context_lens_h,
+    nb::handle cu_seqlens_q_h,
+    int block_size,
+    float scale,
+    bool use_wide) {
+  auto& out = *nb::inst_ptr<array>(out_h);
+  auto& q_nope = *nb::inst_ptr<array>(q_nope_h);
+  auto& q_pe = *nb::inst_ptr<array>(q_pe_h);
+  auto& latent_cache = *nb::inst_ptr<array>(latent_cache_h);
+  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
+  auto& context_lens = *nb::inst_ptr<array>(context_lens_h);
+  auto& cu_seqlens_q = *nb::inst_ptr<array>(cu_seqlens_q_h);
+
+  dispatch_mla_paged_attention_decode_fa(
+      out, q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q,
+      block_size, scale, use_wide, default_stream(Device::gpu));
+}
+
 
 void gdn_linear_attention_impl(
     nb::handle q_h, nb::handle k_h, nb::handle v_h,
@@ -2035,6 +2391,11 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("src"),
         "JIT-compile the MLA paged attention Metal shader (RFC #360).");
 
+  m.def("mla_has_bfloat_fa_kernel", &mla_has_bfloat_fa_kernel,
+        "Runtime probe for bf16 FA kernel availability. Returns false on "
+        "targets without native bfloat support (where mla.metal gates the "
+        "bf16 FA instantiations away). Library must be initialized first.");
+
   m.def("mla_paged_attention", &mla_paged_attention_impl,
         nb::arg("out"),
         nb::arg("q_nope"), nb::arg("q_pe"),
@@ -2071,4 +2432,30 @@ NB_MODULE(_paged_ops, m) {
         "MLX sdpa_vector_2pass-style cross-head amortization for absorbed "
         "MLA decode. One TG per (seq, partition) with 32*num_heads threads, "
         "all heads sharing K cache reads.");
+
+  m.def("mla_paged_attention_decode_fa",
+        &mla_paged_attention_decode_fa_impl,
+        nb::arg("out"),
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("use_wide") = false,
+        "Paged FA decode kernel using simdgroup_matrix<T, 8, 8> MMAs.");
+
+  m.def("mla_paged_attention_decode_fa_partitioned",
+        &mla_paged_attention_decode_fa_partitioned_impl,
+        nb::arg("out"),
+        nb::arg("exp_sums"), nb::arg("max_logits"), nb::arg("tmp_out"),
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("partition_size"), nb::arg("max_num_partitions"),
+        nb::arg("use_wide") = false,
+        "Partitioned (split-K + reduce) variant of the FA decode kernel "
+        "for long-ctx workloads. Same per-partition pipeline as "
+        "mla_paged_attention_decode_fa; reuses the same reduce kernel "
+        "as the 2pass entry.");
 }
