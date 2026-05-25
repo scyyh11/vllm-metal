@@ -16,6 +16,7 @@ from vllm_metal.mlx_backend.mla_cache import MLAPagedLatentCache
 from vllm_metal.paged_attention_backend.mla import (
     MLAPagedAttentionBackend,
     MLAPagedAttentionWrapper,
+    _try_absorb_kv_b_proj_into_inner,
 )
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 
@@ -735,4 +736,218 @@ class TestSinglePassRouting:
         assert (
             MLAPagedAttentionWrapper._pick_heads_per_tg(num_heads, batch_size)
             == expected_g
+        )
+
+
+# DeepSeek-V2-Lite shape: H=16, qk_nope=128, v=128, kvr=512, group_size=64,
+# bits=4 (mlx-community/DeepSeek-V2-Lite-Chat-4bit-mlx). Used by the
+# absorption tests to exercise the same shapes as the production target.
+_DSV2_H = 16
+_DSV2_QK_NOPE = 128
+_DSV2_V = 128
+_DSV2_KVR = 512
+_DSV2_GS = 64
+_DSV2_BITS = 4
+
+
+class _DSv2LiteAbsorbableInner(nn.Module):
+    """kv_b_proj-style inner shaped like DeepSeek-V2-Lite at 4-bit, with no
+    embed_q / unembed_out. Built by quantizing per-head ground-truth k_nope
+    and v matrices, concatenating in the same layout mlx-lm produces, so
+    tests can compare the synthesized absorbed outputs against a dequant
+    reference."""
+
+    def __init__(self, seed: int = 17) -> None:
+        super().__init__()
+        self.num_heads = _DSV2_H
+        self.qk_nope_head_dim = _DSV2_QK_NOPE
+        self.v_head_dim = _DSV2_V
+        self.kv_lora_rank = _DSV2_KVR
+        self.qk_rope_head_dim = 64
+        self.q_lora_rank = None  # DeepSeek-V2-Lite has no q compression
+        self.scale = 1.0 / math.sqrt(_DSV2_KVR)
+
+        prev = mx.random.state
+        mx.random.seed(seed)
+        # Build the canonical kv_b_proj weight: rows are [k_nope_h || v_h]
+        # concatenated over heads, matching mlx-lm's output layout.
+        true_k_nope = [
+            mx.random.normal((_DSV2_QK_NOPE, _DSV2_KVR), dtype=mx.float16) * 0.1
+            for _ in range(_DSV2_H)
+        ]
+        true_v = [
+            mx.random.normal((_DSV2_V, _DSV2_KVR), dtype=mx.float16) * 0.1
+            for _ in range(_DSV2_H)
+        ]
+        full = mx.concatenate(
+            [
+                mx.concatenate([true_k_nope[h], true_v[h]], axis=0)
+                for h in range(_DSV2_H)
+            ],
+            axis=0,
+        )
+        w_q, s, b = mx.quantize(full, group_size=_DSV2_GS, bits=_DSV2_BITS)
+        kv_b = SimpleNamespace(
+            weight=w_q,
+            scales=s,
+            biases=b,
+            group_size=_DSV2_GS,
+            bits=_DSV2_BITS,
+        )
+        self.kv_b_proj = kv_b
+        # Stash the dequant-of-full reference so tests can recompute the
+        # per-head dequant slices without re-touching mlx.quantize.
+        self._reference_full_dequant = mx.dequantize(
+            w_q,
+            s,
+            b,
+            group_size=_DSV2_GS,
+            bits=_DSV2_BITS,
+        )
+        mx.random.state = prev
+
+
+class TestKvBProjAbsorption:
+    """Verifies _try_absorb_kv_b_proj_into_inner synthesizes per-head
+    embed_q / unembed_out from a kv_b_proj-style inner so the single-pass
+    MLA kernel admission gate can accept it. Exercises the production
+    shape (DeepSeek-V2-Lite at 4-bit)."""
+
+    def test_synthesizes_absorbed_pair(self) -> None:
+        inner = _DSv2LiteAbsorbableInner()
+        assert not hasattr(inner, "embed_q")
+        assert not hasattr(inner, "unembed_out")
+
+        absorbed = _try_absorb_kv_b_proj_into_inner(inner)
+
+        assert absorbed is True
+        assert hasattr(inner, "embed_q")
+        assert hasattr(inner, "unembed_out")
+
+    def test_embed_q_matches_per_head_dequant(self) -> None:
+        inner = _DSv2LiteAbsorbableInner()
+        _try_absorb_kv_b_proj_into_inner(inner)
+
+        full = inner._reference_full_dequant.reshape(
+            _DSV2_H,
+            _DSV2_QK_NOPE + _DSV2_V,
+            _DSV2_KVR,
+        )
+        ref_k_nope = full[:, :_DSV2_QK_NOPE, :]  # (H, qk_nope, kvr)
+
+        # The kernel fast path calls embed_q with shape (1, H, L, qk_nope).
+        q = mx.random.normal((1, _DSV2_H, 3, _DSV2_QK_NOPE), dtype=mx.float16)
+        y_ref = mx.stack(
+            [q[:, h] @ ref_k_nope[h] for h in range(_DSV2_H)],
+            axis=1,
+        )
+        y_got = inner.embed_q(q)
+        mx.eval(y_ref, y_got)
+        # atol=1.5e-2 covers fp16 accumulation noise over 512-wide reductions
+        # (unembed) on top of 4-bit weight reconstruction; the absorbed path
+        # and the dequant reference start from the SAME quantized weight, so
+        # the difference is purely accumulation order, not algorithmic.
+        assert bool(mx.allclose(y_got, y_ref, rtol=1e-3, atol=1.5e-2))
+
+    def test_unembed_out_matches_per_head_dequant(self) -> None:
+        inner = _DSv2LiteAbsorbableInner()
+        _try_absorb_kv_b_proj_into_inner(inner)
+
+        full = inner._reference_full_dequant.reshape(
+            _DSV2_H,
+            _DSV2_QK_NOPE + _DSV2_V,
+            _DSV2_KVR,
+        )
+        ref_v = full[:, _DSV2_QK_NOPE:, :]  # (H, v, kvr)
+
+        # The kernel fast path calls unembed_out with (1, H, L, kvr).
+        ctx = mx.random.normal((1, _DSV2_H, 3, _DSV2_KVR), dtype=mx.float16)
+        y_ref = mx.stack(
+            [ctx[:, h] @ ref_v[h].T for h in range(_DSV2_H)],
+            axis=1,
+        )
+        y_got = inner.unembed_out(ctx)
+        mx.eval(y_ref, y_got)
+        # atol=1.5e-2 covers fp16 accumulation noise over 512-wide reductions
+        # (unembed) on top of 4-bit weight reconstruction; the absorbed path
+        # and the dequant reference start from the SAME quantized weight, so
+        # the difference is purely accumulation order, not algorithmic.
+        assert bool(mx.allclose(y_got, y_ref, rtol=1e-3, atol=1.5e-2))
+
+    def test_idempotent(self) -> None:
+        inner = _DSv2LiteAbsorbableInner()
+        assert _try_absorb_kv_b_proj_into_inner(inner) is True
+        assert _try_absorb_kv_b_proj_into_inner(inner) is False
+
+    def test_no_kv_b_proj_is_noop(self) -> None:
+        class Empty(nn.Module):
+            pass
+
+        assert _try_absorb_kv_b_proj_into_inner(Empty()) is False
+
+    def test_already_absorbed_is_noop(self) -> None:
+        # A pre-absorbed inner (GLM4MoeLite-style) must not be re-wrapped.
+        inner = _KernelDimsAbsorbedInner()
+        assert _try_absorb_kv_b_proj_into_inner(inner) is False
+
+    def test_bad_kv_b_proj_shape_raises(self) -> None:
+        class Bad(nn.Module):
+            num_heads = 4
+            qk_nope_head_dim = 64
+            v_head_dim = 96
+            kv_lora_rank = 256
+            kv_b_proj = SimpleNamespace(weight=mx.zeros((100, 256)))
+
+        with pytest.raises(ValueError, match="absorption layout"):
+            _try_absorb_kv_b_proj_into_inner(Bad())
+
+    def test_wrapper_skips_absorption_when_env_off(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_ABSORB_KV_B_PROJ", False)
+        inner = _DSv2LiteAbsorbableInner()
+        cache = MLAPagedLatentCache(
+            num_layers=1,
+            latent_dim=_DSV2_KVR + 64,
+            num_blocks=4,
+            block_size=16,
+            dtype=mx.float16,
+        )
+        wrapper = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
+        assert wrapper._is_absorbed is False
+        assert not hasattr(inner, "embed_q")
+
+    def test_wrapper_absorbs_when_env_on(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_ABSORB_KV_B_PROJ", True)
+        inner = _DSv2LiteAbsorbableInner()
+        cache = MLAPagedLatentCache(
+            num_layers=1,
+            latent_dim=_DSV2_KVR + 64,
+            num_blocks=4,
+            block_size=16,
+            dtype=mx.float16,
+        )
+        wrapper = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
+        assert wrapper._is_absorbed is True
+        assert hasattr(inner, "embed_q")
+        assert hasattr(inner, "unembed_out")
+
+    def test_absorption_unlocks_kernel_admission(self, monkeypatch) -> None:
+        """End-to-end: absorbed DeepSeek-V2-Lite-shaped inner passes the
+        kernel admission gate that previously rejected its kv_b_proj-only
+        form."""
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_ABSORB_KV_B_PROJ", True)
+        inner = _DSv2LiteAbsorbableInner()
+        cache = MLAPagedLatentCache(
+            num_layers=1,
+            latent_dim=_DSV2_KVR + 64,
+            num_blocks=4,
+            block_size=16,
+            dtype=mx.float16,
+        )
+        wrapper = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
+            )
+            is True
         )

@@ -19,6 +19,155 @@ from vllm_metal.paged_attention_common import find_attn_attr, find_layers, get_c
 MLA_DEFAULT_QK_ROPE_HEAD_DIM = 64
 
 
+class _AbsorbedEmbedQ(nn.Module):
+    """Per-head q_nope -> kv_lora_rank projection synthesized from a
+    kv_b_proj's k_nope slice. Uses quantized_matmul(transpose=False) so
+    the slice stays in its original storage (rows = qk_nope_head_dim,
+    packed cols = kv_lora_rank) and no dequant+transpose+requant is
+    needed."""
+
+    def __init__(
+        self,
+        weight: mx.array,
+        scales: mx.array,
+        biases: mx.array,
+        group_size: int,
+        bits: int,
+    ) -> None:
+        super().__init__()
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.group_size = group_size
+        self.bits = bits
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return mx.quantized_matmul(
+            x,
+            self.weight,
+            self.scales,
+            self.biases,
+            transpose=False,
+            group_size=self.group_size,
+            bits=self.bits,
+        )
+
+
+class _AbsorbedUnembedOut(nn.Module):
+    """Per-head kv_lora_rank -> v_head_dim projection synthesized from a
+    kv_b_proj's v slice. Standard quantized-linear orientation (storage
+    matches nn.QuantizedLinear), so transpose=True (the default)."""
+
+    def __init__(
+        self,
+        weight: mx.array,
+        scales: mx.array,
+        biases: mx.array,
+        group_size: int,
+        bits: int,
+    ) -> None:
+        super().__init__()
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.group_size = group_size
+        self.bits = bits
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return mx.quantized_matmul(
+            x,
+            self.weight,
+            self.scales,
+            self.biases,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+        )
+
+
+class _UnquantAbsorbedEmbedQ(nn.Module):
+    def __init__(self, weight: mx.array) -> None:
+        super().__init__()
+        self.weight = weight  # (H, qk_nope_head_dim, kv_lora_rank)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return x @ self.weight
+
+
+class _UnquantAbsorbedUnembedOut(nn.Module):
+    def __init__(self, weight: mx.array) -> None:
+        super().__init__()
+        self.weight = weight  # (H, v_head_dim, kv_lora_rank)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return x @ self.weight.swapaxes(-1, -2)
+
+
+def _try_absorb_kv_b_proj_into_inner(inner: nn.Module) -> bool:
+    """If ``inner`` exposes ``kv_b_proj`` but not the absorbed pair
+    (``embed_q`` / ``unembed_out``), synthesize per-head ``embed_q`` and
+    ``unembed_out`` by slicing ``kv_b_proj`` along the output axis.
+
+    DeepSeek-V2 / MiniCPM3 keep a single ``kv_b_proj = nn.Linear(kvr,
+    H*(qk_nope+v))``; the single-pass MLA kernel requires the absorbed
+    form that GLM4MoeLite ships natively. Quant groups in mlx live on
+    the input axis (``kv_lora_rank``), so slicing per-head along the
+    output axis preserves the quantization scheme — no requant noise.
+
+    No-op (returns False) when the inner is already absorbed or has no
+    ``kv_b_proj``. Idempotent. Raises ``ValueError`` if the kv_b_proj
+    output dimension does not match ``H * (qk_nope_head_dim +
+    v_head_dim)``.
+    """
+    if hasattr(inner, "embed_q") and hasattr(inner, "unembed_out"):
+        return False
+    kv_b = getattr(inner, "kv_b_proj", None)
+    if kv_b is None:
+        return False
+
+    n_heads = inner.num_heads
+    qk_nope = inner.qk_nope_head_dim
+    v = inner.v_head_dim
+    kvr = inner.kv_lora_rank
+
+    w = kv_b.weight
+    expected_rows = n_heads * (qk_nope + v)
+    if w.shape[0] != expected_rows:
+        raise ValueError(
+            f"kv_b_proj.weight rows {w.shape[0]} != n_heads*(qk_nope_head_dim+"
+            f"v_head_dim) = {n_heads}*{qk_nope + v}; absorption layout "
+            f"assumption violated for this model"
+        )
+
+    if hasattr(kv_b, "scales"):
+        s = kv_b.scales
+        b = kv_b.biases
+        pack = w.shape[1]
+        w_per_head = w.reshape(n_heads, qk_nope + v, pack)
+        s_per_head = s.reshape(n_heads, qk_nope + v, s.shape[1])
+        b_per_head = b.reshape(n_heads, qk_nope + v, b.shape[1])
+        inner.embed_q = _AbsorbedEmbedQ(
+            w_per_head[:, :qk_nope, :],
+            s_per_head[:, :qk_nope, :],
+            b_per_head[:, :qk_nope, :],
+            kv_b.group_size,
+            kv_b.bits,
+        )
+        inner.unembed_out = _AbsorbedUnembedOut(
+            w_per_head[:, qk_nope:, :],
+            s_per_head[:, qk_nope:, :],
+            b_per_head[:, qk_nope:, :],
+            kv_b.group_size,
+            kv_b.bits,
+        )
+    else:
+        w_per_head = w.reshape(n_heads, qk_nope + v, kvr)
+        inner.embed_q = _UnquantAbsorbedEmbedQ(w_per_head[:, :qk_nope, :])
+        inner.unembed_out = _UnquantAbsorbedUnembedOut(w_per_head[:, qk_nope:, :])
+
+    return True
+
+
 class MLAPagedAttentionWrapper(nn.Module):
     """Wraps an MLA attention module to use a paged latent cache.
 
@@ -54,6 +203,8 @@ class MLAPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_mla_layer_idx", layer_idx)
         object.__setattr__(self, "_mla_latent_cache", latent_cache)
+        if envs.VLLM_METAL_MLA_ABSORB_KV_B_PROJ:
+            _try_absorb_kv_b_proj_into_inner(inner)
         is_absorbed = hasattr(inner, "embed_q") and hasattr(inner, "unembed_out")
         object.__setattr__(self, "_is_absorbed", is_absorbed)
         if is_absorbed:
