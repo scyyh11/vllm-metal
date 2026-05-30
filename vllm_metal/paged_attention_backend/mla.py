@@ -195,6 +195,76 @@ class MLAPagedAttentionWrapper(nn.Module):
         out_unembedded = inner.unembed_out(out_for_unembed)
         return out_unembedded.transpose(0, 2, 1, 3).reshape(1, seq_len, -1)
 
+    def _materialized_prefill_ok(
+        self, inner: nn.Module, latent_cache: MLAPagedLatentCache, ctx: Any
+    ) -> bool:
+        """Gate for the materialized-prefill fast path (RFC #360 Phase 2): opt-in,
+        absorbed model with MultiLinear ``embed_q``/``unembed_out``, and pure
+        prefill (past=0). Any request with past context falls through to the
+        absorbed kv_lora-space loop."""
+        if not envs.VLLM_METAL_MLA_MATERIALIZED_PREFILL or not self._is_absorbed:
+            return False
+        # Materialization reverses embed_q/unembed_out via MultiLinear's transpose
+        # flag (per-head + quantization-aware).
+        if type(inner.embed_q).__name__ not in ("MultiLinear", "QuantizedMultiLinear"):
+            return False
+        cu = ctx.cu_seqlens
+        has_prefill = False
+        for i, ctx_len in enumerate(ctx.context_lens):
+            num_new = cu[i + 1] - cu[i]
+            has_prefill = has_prefill or num_new > 1
+            if ctx_len != num_new:  # past>0 (chunked prefill) — follow-up
+                return False
+        return has_prefill
+
+    def _materialized_prefill(
+        self,
+        inner: nn.Module,
+        q_nope: mx.array,  # [1, nheads, seq, qk_nope_head_dim]
+        q_pe: mx.array,  # [1, nheads, seq, qk_rope_head_dim] (post-RoPE)
+        kv_norm: mx.array,  # [1, seq, kv_lora_rank]
+        k_pe: mx.array,  # [1, 1, seq, qk_rope_head_dim] (post-RoPE)
+        ctx: Any,
+        seq_len: int,
+    ) -> mx.array:
+        """Materialize full per-head K/V from the absorbed embed_q/unembed_out
+        weights (mirroring upstream ``forward_mha``) and run prefill as standard
+        MHA via MLX SDPA — much cheaper than the absorbed kv_lora-space path
+        (512-wide MQA), with no custom kernel. Returns
+        [1, seq, num_heads * v_head_dim] for ``o_proj``.
+
+        ``K_nope = embed_q(kv_norm, transpose=False)``, ``V = unembed_out(kv_norm)``;
+        MultiLinear's transpose flag reuses ``quantized_matmul`` so quantized
+        weights work unchanged. PE folds into the materialized Q·K (no extra mask)."""
+        nheads = inner.num_heads
+        scale = self._attention_scale()
+        kvn = kv_norm.reshape(seq_len, inner.kv_lora_rank)
+        # Batched materialization: one GEMM each over all tokens in the step.
+        k_nope = inner.embed_q(kvn, transpose=False)  # [nheads, seq, qk_nope]
+        values = inner.unembed_out(kvn)  # [nheads, seq, v_head_dim]
+        k_pe_b = mx.broadcast_to(
+            k_pe.reshape(1, seq_len, inner.qk_rope_head_dim),
+            (nheads, seq_len, inner.qk_rope_head_dim),
+        )
+        keys = mx.concatenate([k_nope, k_pe_b], axis=-1)  # [nheads, seq, qk]
+        queries = mx.concatenate([q_nope[0], q_pe[0]], axis=-1)  # [nheads, seq, qk]
+
+        cu = ctx.cu_seqlens
+        outs = []
+        for i in range(len(ctx.context_lens)):  # per-request causal MHA (past=0)
+            s, e = cu[i], cu[i + 1]
+            out = scaled_dot_product_attention(
+                queries[:, s:e][None],
+                keys[:, s:e][None],
+                values[:, s:e][None],
+                cache=None,
+                scale=scale,
+                mask="causal",
+            )  # [1, nheads, num_new, v_head_dim]
+            outs.append(out[0].transpose(1, 0, 2))  # [num_new, nheads, v_head_dim]
+        final = mx.concatenate(outs, axis=0) if len(outs) > 1 else outs[0]
+        return final.reshape(1, seq_len, nheads * inner.v_head_dim)
+
     def _apply_absorbed_mla_attention(
         self,
         *,
@@ -322,6 +392,23 @@ class MLAPagedAttentionWrapper(nn.Module):
         latent_cache.latent_caches[layer_idx] = flat.reshape(
             latent_cache.num_blocks, latent_cache.block_size, latent_cache.latent_dim
         )
+
+        # Materialized-prefill fast path (opt-in; absorbed model, past=0).
+        # Materializes full K/V and runs standard MHA via MLX SDPA instead of the
+        # absorbed 512-wide MQA loop (RFC #360 Phase 2). Falls through otherwise.
+        if self._materialized_prefill_ok(inner, latent_cache, ctx):
+            final = self._materialized_prefill(
+                inner, q_nope, q_pe, kv_norm, k_pe, ctx, seq_len
+            )
+            # `final` is computed from kv_norm/k_pe directly and does not gather
+            # from latent_caches[layer_idx]. The SDPA loop below gathers, so its
+            # scatter-write rides the logits graph and is forced by the runner's
+            # eval; here that dependency is absent, so the cache write would stay
+            # lazy and be deferred into the first decode (inflating its latency
+            # and the live graph across all-prefill steps). Schedule it now so it
+            # lands during prefill, overlapped with the rest of the forward.
+            mx.async_eval(latent_cache.latent_caches[layer_idx])
+            return inner.o_proj(final)
 
         # Env-gated single-pass Metal kernel fast path. Falls through
         # to the per-request MLX SDPA loop below when the gate rejects
