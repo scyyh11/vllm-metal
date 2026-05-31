@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end test for the materialized-MLA prefill fast path
-(``VLLM_METAL_MLA_MATERIALIZED_PREFILL``). Routing absorbed-MLA prefill through
-materialized full K/V + standard MHA (MLX SDPA) must match the absorbed
-kv_lora-space path. No custom kernel; works on any GPU."""
+"""End-to-end test for materialized-MLA prefill. Absorbed-MLA prefill is routed
+through materialized full K/V + standard MHA (MLX SDPA), which must match the
+absorbed kv_lora-space path (the absorption identity). On by default for
+absorbed models; no custom kernel; works on any GPU."""
 
 from __future__ import annotations
-
-import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -52,13 +50,18 @@ def _clear_ctx():
     pac.clear_context()
     yield
     pac.clear_context()
-    os.environ.pop("VLLM_METAL_MLA_MATERIALIZED_PREFILL", None)
 
 
-def _make():
+def _make(quantize: bool = False):
     mx.random.seed(0)
     inner = _AbsorbedInner()
     inner.apply(lambda p: p.astype(mx.float16))
+    if quantize:
+        # GLM-4.7-Flash-4bit ships embed_q/unembed_out as QuantizedMultiLinear,
+        # whose quantized_matmul broadcasts the per-head weights differently from
+        # the dense `x @ weight` — guards the 4bit materialization shape path.
+        inner.embed_q = inner.embed_q.to_quantized(64, 4)
+        inner.unembed_out = inner.unembed_out.to_quantized(64, 4)
     cache = MLAPagedLatentCache(
         num_layers=1,
         latent_dim=_KVL + _ROPE,
@@ -73,8 +76,15 @@ def _make():
     )
 
 
-def test_materialized_prefill_matches_absorbed_loop() -> None:
-    inner, cache, wrapper = _make()
+@pytest.mark.parametrize(
+    ("quantize", "atol"),
+    [(False, 2e-2), (True, 6e-2)],
+    ids=["dense", "quantized-4bit"],
+)
+def test_materialized_prefill_matches_absorbed_loop(
+    quantize: bool, atol: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inner, cache, wrapper = _make(quantize=quantize)
     lens = [16, 48]  # 2 prefill requests, past=0, block-aligned
     total = sum(lens)
     cu = [0] + [int(c) for c in np.cumsum(lens)]
@@ -87,8 +97,7 @@ def test_materialized_prefill_matches_absorbed_loop() -> None:
     )
     x = mx.random.normal((1, total, _HID)).astype(mx.float16)
 
-    def run(flag: str) -> mx.array:
-        os.environ["VLLM_METAL_MLA_MATERIALIZED_PREFILL"] = flag
+    def run() -> mx.array:
         cache.latent_caches[0] = mx.zeros_like(cache.latent_caches[0])
         pac.set_context(ctx)
         out = wrapper(x, mask=None, cache=None)
@@ -96,18 +105,24 @@ def test_materialized_prefill_matches_absorbed_loop() -> None:
         pac.clear_context()
         return out
 
-    ref = run("0")  # absorbed kv_lora-space (512-wide MQA) loop
-    mat = run("1")  # materialized full-K/V MHA
+    # Reference: force the gate off → absorbed kv_lora-space (512-wide MQA) loop.
+    monkeypatch.setattr(
+        MLAPagedAttentionWrapper, "_materialized_prefill_ok", lambda *a, **k: False
+    )
+    ref = run()
+    monkeypatch.undo()  # restore the real gate → materialized path (on by default)
+    mat = run()
 
     assert mat.shape == (1, total, _HID)
-    np.testing.assert_allclose(np.array(mat), np.array(ref), atol=2e-2, rtol=1e-2)
+    np.testing.assert_allclose(np.array(mat), np.array(ref), atol=atol, rtol=1e-2)
 
 
-def test_materialized_prefill_gate_off_by_default() -> None:
-    """Without the env flag the fast path must not engage (no behavioral change)."""
+def test_materialized_prefill_gate() -> None:
+    """The gate engages for an absorbed model on pure prefill (past=0) and falls
+    back to the absorbed loop for chunked prefill (past>0)."""
     inner, cache, wrapper = _make()
-    os.environ.pop("VLLM_METAL_MLA_MATERIALIZED_PREFILL", None)
-    assert not wrapper._materialized_prefill_ok(
+    # pure prefill (past=0): ctx_len == num_new → engage
+    assert wrapper._materialized_prefill_ok(
         inner,
         cache,
         pac.PagedAttentionContext(
@@ -116,5 +131,17 @@ def test_materialized_prefill_gate_off_by_default() -> None:
             context_lens=[2],
             cu_seqlens=[0, 2],
             offsets=[0],
+        ),
+    )
+    # past>0 (ctx_len 4 > num_new 2): chunked prefill → fall back
+    assert not wrapper._materialized_prefill_ok(
+        inner,
+        cache,
+        pac.PagedAttentionContext(
+            slot_mapping=[0, 1],
+            block_tables=[[0]],
+            context_lens=[4],
+            cu_seqlens=[0, 2],
+            offsets=[2],
         ),
     )

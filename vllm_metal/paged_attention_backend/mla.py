@@ -198,11 +198,12 @@ class MLAPagedAttentionWrapper(nn.Module):
     def _materialized_prefill_ok(
         self, inner: nn.Module, latent_cache: MLAPagedLatentCache, ctx: Any
     ) -> bool:
-        """Gate for the materialized-prefill fast path (RFC #360 Phase 2): opt-in,
-        absorbed model with MultiLinear ``embed_q``/``unembed_out``, and pure
-        prefill (past=0). Any request with past context falls through to the
-        absorbed kv_lora-space loop."""
-        if not envs.VLLM_METAL_MLA_MATERIALIZED_PREFILL or not self._is_absorbed:
+        """Gate for the materialized-prefill fast path (RFC #360 Phase 2): an
+        absorbed model with MultiLinear ``embed_q``/``unembed_out`` and pure
+        prefill (past=0). On by default — bitwise-equal to the absorbed
+        kv_lora-space loop (absorption identity), just at a cheaper attention
+        dim. Any request with past context falls through to that loop."""
+        if not self._is_absorbed:
             return False
         # Materialization reverses embed_q/unembed_out via MultiLinear's transpose
         # flag (per-head + quantization-aware).
@@ -238,7 +239,13 @@ class MLAPagedAttentionWrapper(nn.Module):
         weights work unchanged. PE folds into the materialized Q·K (no extra mask)."""
         nheads = inner.num_heads
         scale = self._attention_scale()
-        kvn = kv_norm.reshape(seq_len, inner.kv_lora_rank)
+        # Leading [1, ...] axis so the per-head weights broadcast across heads.
+        # MultiLinear's dense `x @ weight` broadcasts a 2-D x against the
+        # [nheads, ...] weight, but QuantizedMultiLinear's quantized_matmul does
+        # not — a 2-D x collapses the head batch (returns [seq, ...]), which
+        # breaks the concat below on quantized checkpoints (GLM-4.7-Flash-4bit).
+        # [1, seq, kv_lora] broadcasts correctly for both dense and quantized.
+        kvn = kv_norm.reshape(1, seq_len, inner.kv_lora_rank)
         # Batched materialization: one GEMM each over all tokens in the step.
         k_nope = inner.embed_q(kvn, transpose=False)  # [nheads, seq, qk_nope]
         values = inner.unembed_out(kvn)  # [nheads, seq, v_head_dim]

@@ -15,7 +15,6 @@
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
 | `VLLM_METAL_GDN_LAZY_KERNELS` | `1` | Enable lazy GDN kernels for eligible hybrid batches. Set to `0` to force the eager conv / C++ recurrent fallback path. |
 | `VLLM_METAL_MLA_KERNEL` | `0` | Enable the experimental absorbed-MLA single-pass Metal decode kernel ([RFC #360](https://github.com/vllm-project/vllm-metal/issues/360)). Off by default; the MLA wrapper falls back to the MLX SDPA per-request slow path. Set to `1` to route absorbed-MLA decode through the kernel when the workload matches the instantiated specialization (`kv_lora_rank=512`, `qk_rope_head_dim=64`, `block_size ∈ {16, 32}`, fp16/bf16, decode-only). |
-| `VLLM_METAL_MLA_MATERIALIZED_PREFILL` | `0` | Enable the experimental absorbed-MLA **prefill** fast path ([RFC #360](https://github.com/vllm-project/vllm-metal/issues/360) Phase 2). Off by default; absorbed MLA models (GLM-4.7 / DeepSeek-V3) compute prefill in `kv_lora` space (512-wide MQA). Set to `1` to instead materialize full per-head K/V from the absorbed `embed_q`/`unembed_out` weights and run standard MHA via MLX SDPA — ~1.8× faster prefill on GLM-4.7, no custom kernel. Applies only to absorbed models with `MultiLinear` `embed_q`/`unembed_out` and pure prefill (no past context); falls back to the absorbed loop otherwise. |
 
 ## Multimodal Serve Modes
 
