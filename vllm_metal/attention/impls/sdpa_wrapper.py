@@ -78,6 +78,16 @@ class SDPAPagedAttentionWrapper(nn.Module):
             self, "_mk_cache_idx", cache_idx if cache_idx is not None else layer_idx
         )
 
+    @property
+    def rotary_emb(self) -> Any:
+        """Expose the wrapped attention's M-RoPE module."""
+        return self._inner.rotary_emb
+
+    @property
+    def rope(self) -> Any:
+        """Expose the wrapped attention's RoPE module."""
+        return self._inner.rope
+
     def rebind_cache(
         self,
         kv_cache: MetalPagedKVCache,

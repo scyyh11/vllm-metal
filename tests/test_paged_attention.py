@@ -37,6 +37,23 @@ class TestSDPAPagedAttentionWrapper:
     def teardown_method(self):
         clear_context()
 
+    def test_exposes_inner_rope_attributes(self):
+        class _Inner:
+            def __init__(self):
+                self.rotary_emb = object()
+                self.rope = object()
+
+        inner = _Inner()
+        wrapper = SDPAPagedAttentionWrapper(
+            inner,
+            layer_idx=0,
+            kv_cache=object(),
+            block_size=16,
+        )
+
+        assert wrapper.rotary_emb is inner.rotary_emb
+        assert wrapper.rope is inner.rope
+
     def test_forwards_precomputed_rope_embeddings_without_context(self):
         class _Inner:
             def __init__(self):
