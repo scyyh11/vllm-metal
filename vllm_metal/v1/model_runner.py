@@ -21,6 +21,7 @@ from mlx_lm import stream_generate
 from mlx_lm.models.cache import make_prompt_cache
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
@@ -58,6 +59,7 @@ from vllm_metal.v1.contiguous_cache import (
     _merge_kv_caches,
 )
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantRuntime
+from vllm_metal.v1.lora import MetalLoRARuntime
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import (
     DefaultModelAdapter,
@@ -98,6 +100,13 @@ SchedulerMemoryReportingMode: TypeAlias = Literal[
 ]
 
 
+def _lora_id_from_request_data(new_req: NewRequestData) -> int | None:
+    """Pull the int LoRA ID off a `NewRequestData` record."""
+    if new_req.lora_request is None:
+        return None
+    return int(new_req.lora_request.lora_int_id)
+
+
 def _create_request_generator(
     device: torch.device,
     sampling_params: SamplingParams,
@@ -133,6 +142,7 @@ class RequestState:
     block_ids: list[int] = field(
         default_factory=list
     )  # Scheduler-assigned paged KV blocks
+    lora_id: int | None = None
     # Decode reconstructs M-RoPE positions as
     # ``len(token_ids) - 1 + mrope_position_delta``; ``None`` for text-only.
     mrope_position_delta: int | None = None
@@ -149,6 +159,7 @@ class PrefillRequest(NamedTuple):
     prompt_len: int | None  # full prompt length (None for intermediate chunks)
     start_pos: int  # RoPE / slot offset (0 = fresh, >0 = continuation)
     full_prompt_token_ids: list[int] | None  # full prompt for sampling metadata
+    lora_id: int | None = None  # None = no LoRA adapter for this request
     pooling_params: PoolingParams | None = None
 
 
@@ -259,6 +270,7 @@ class MetalModelRunner:
         self._model_adapter: ModelAdapter = DefaultModelAdapter()
         self._cache_policy = ModelCachePolicy(self, self._model_adapter)
         self._model_lifecycle = ModelLifecycle(self, self._model_adapter)
+        self._lora = MetalLoRARuntime()
         self._spec_decode_controller = SpeculativeDecodeController()
 
         self.model: Any = None
@@ -400,6 +412,46 @@ class MetalModelRunner:
     def load_model(self) -> None:
         """Load the configured model and derive runtime metadata."""
         self._model_lifecycle.load()
+        text_config = getattr(self.model_config.hf_config, "get_text_config", None)
+        max_position_embeddings = None
+        if callable(text_config):
+            cfg = text_config()
+            max_position_embeddings = getattr(cfg, "max_position_embeddings", None)
+        self._lora.setup(
+            model=self._forward_model,
+            lora_config=getattr(self.vllm_config, "lora_config", None),
+            is_stt=False,
+            paged_attention_enabled=self.metal_config.use_paged_attention,
+            speculative_decode_enabled=self.vllm_config.speculative_config is not None,
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            dtype=self.kv_cache_dtype or mx.float16,
+            max_position_embeddings=max_position_embeddings,
+        )
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        return self._lora.add_adapter(lora_request)
+
+    def remove_lora(self, lora_id: int) -> bool:
+        return self._lora.remove_adapter(lora_id)
+
+    def pin_lora(self, lora_id: int) -> bool:
+        return self._lora.pin_adapter(lora_id)
+
+    def list_loras(self) -> set[int]:
+        return self._lora.list_adapters()
+
+    def _paged_lora_routing(
+        self,
+        decode_reqs: list[tuple[str, RequestState]],
+        prefill_pack: list[PrefillRequest],
+    ) -> list[tuple[int | None, int]]:
+        entries: list[tuple[int | None, int]] = []
+        for _, state in decode_reqs:
+            entries.append((state.lora_id, 1))
+        for pr in prefill_pack:
+            entries.append((pr.lora_id, len(pr.token_ids)))
+        return entries
 
     def _gdn_alloc_slot(self, req_id: str) -> int:
         """Allocate a stable GDN state pool slot for a request."""
@@ -1268,6 +1320,7 @@ class MetalModelRunner:
                     generator=prefill.generator,
                     generated_tokens=1,
                     block_ids=prefill.block_ids,
+                    lora_id=prefill.lora_id,
                     mrope_position_delta=mm_delta,
                 )
                 continue
@@ -1759,6 +1812,9 @@ class MetalModelRunner:
             # ``execute_model``; no further bookkeeping needed here.
             token_ids = new_req.prompt_token_ids or []
             sampling_params = new_req.sampling_params or SamplingParams()
+            lora_id = _lora_id_from_request_data(new_req)
+            if new_req.lora_request is not None:
+                self._lora.add_adapter(new_req.lora_request)
 
             if not token_ids:
                 batch.add_output(req_id, [0])
@@ -1789,6 +1845,7 @@ class MetalModelRunner:
                             prompt_len=prompt_len if not is_intermediate else None,
                             start_pos=computed_tokens,
                             full_prompt_token_ids=None,
+                            lora_id=lora_id,
                         ),
                         result_mode="intermediate" if is_intermediate else "new_final",
                     )
@@ -1806,6 +1863,7 @@ class MetalModelRunner:
                         generator=generator,
                         generated_tokens=0,
                         block_ids=sched_block_ids,
+                        lora_id=lora_id,
                     )
                 continue
 
@@ -1824,6 +1882,7 @@ class MetalModelRunner:
                 generator=generator,
                 generated_tokens=1,
                 block_ids=[],
+                lora_id=lora_id,
             )
 
     def _update_cached_request_blocks(
@@ -1904,6 +1963,7 @@ class MetalModelRunner:
                             ),
                             start_pos=computed_tokens,
                             full_prompt_token_ids=None,
+                            lora_id=state.lora_id,
                         ),
                         result_mode=(
                             "intermediate" if is_intermediate else "cached_final"
@@ -1978,6 +2038,7 @@ class MetalModelRunner:
                     prompt_len=prefill.prompt_len,
                     start_pos=prefill.start_pos,
                     full_prompt_token_ids=full_prompt,
+                    lora_id=prefill.lora_id,
                 )
             )
 
@@ -2168,6 +2229,9 @@ class MetalModelRunner:
 
         if self._paged_attention_runtime is not None and batch.has_paged_work():
             prefill_pack = self._build_prefill_pack(batch)
+            self._lora.prepare_step(
+                self._paged_lora_routing(batch.paged_decode_reqs, prefill_pack)
+            )
             self._start_paged_forward(
                 batch,
                 prefill_pack,
