@@ -15,6 +15,9 @@ from vllm.v1.core.sched.output import (
 )
 
 from tests.stub_runner import make_stub_runner
+from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
+from vllm_metal.attention.state import HybridGDNStateManager
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.multimodal.qwen3_vl import (
     Qwen3VLMultimodalAdapter,
@@ -91,10 +94,37 @@ def _runner_with_encoder_cache():
     return make_stub_runner(encoder_cache=EncoderCache())
 
 
-def _paged_runner_with_encoder_cache():
+class HybridRuntimeStub:
+    def __init__(self, state_cache: GDNPagedStateCache) -> None:
+        self.gdn_state_manager = HybridGDNStateManager(state_cache)
+
+    def needs_step_context(self) -> bool:
+        return True
+
+    def populate_step_context(self, *, req_ids: list[str], ctx: object) -> None:
+        self.gdn_state_manager.populate_step_context(req_ids=req_ids, ctx=ctx)
+
+    def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
+        self.gdn_state_manager.extend_forward_eval_outputs(outputs)
+
+    def release_requests(self, req_ids: set[str]) -> None:
+        self.gdn_state_manager.release_requests(req_ids)
+
+    def materialize_pending_state(self) -> None:
+        self.gdn_state_manager.materialize_pending_state()
+
+
+def _paged_runner_with_encoder_cache(*, runtime: object | None = None):
     runner = make_stub_runner(
         encoder_cache=EncoderCache(),
-        _paged_attention_runtime=MagicMock(),
+        _paged_attention_runtime=runtime
+        or MHAPagedAttentionRuntime(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            block_size=16,
+            dtype=mx.float32,
+        ),
         _paged_block_size=16,
     )
     runner._start_paged_forward = MagicMock()
@@ -125,7 +155,19 @@ def test_cleanup_finished_requests_removes_mm_features() -> None:
 
 
 def test_preempted_requests_keep_resume_state() -> None:
-    runner = _runner_with_encoder_cache()
+    state_cache = GDNPagedStateCache(
+        num_layers=1,
+        max_seqs=4,
+        conv_kernel_dim=2,
+        conv_dim=4,
+        num_v_heads=1,
+        value_head_dim=4,
+        key_head_dim=4,
+        initial_seqs=0,
+        dtype=mx.float32,
+    )
+    runtime = HybridRuntimeStub(state_cache)
+    runner = _paged_runner_with_encoder_cache(runtime=runtime)
     features = [_feature("image-0")]
     assert runner.encoder_cache is not None
     runner.encoder_cache.add_request("req-0", features)
@@ -137,14 +179,14 @@ def test_preempted_requests_keep_resume_state() -> None:
     )
     runner._request_states["req-0"] = state
     runner._paged_request_seq_lens["req-0"] = 2
-    runner._gdn_req_to_slot["req-0"] = 0
+    [slot_id] = runtime.gdn_state_manager.assign_step_slots(["req-0"])
 
     runner.execute_model(_scheduler_output(preempted_req_ids={"req-0"}))
 
     assert runner.encoder_cache.mm_features["req-0"] == features
     assert runner._request_states["req-0"] is state
     assert runner._paged_request_seq_lens["req-0"] == 2
-    assert runner._gdn_req_to_slot["req-0"] == 0
+    assert runtime.gdn_state_manager.request_slots["req-0"] == slot_id
 
 
 def test_resubmitted_request_keeps_new_mm_features() -> None:

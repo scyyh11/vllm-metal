@@ -13,13 +13,54 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
-from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
+from vllm_metal.attention.state import HybridGDNStateManager
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 
 
-class _HybridBackendStub(HybridPagedAttentionRuntime):
-    pass
+class HybridRuntimeStub:
+    def __init__(self, state_cache: GDNPagedStateCache) -> None:
+        self._gdn_state_manager = HybridGDNStateManager(state_cache)
+
+    def needs_step_context(self) -> bool:
+        return True
+
+    @property
+    def gdn_state_manager(self) -> HybridGDNStateManager:
+        return self._gdn_state_manager
+
+    def populate_step_context(self, *, req_ids: list[str], ctx) -> None:
+        self._gdn_state_manager.populate_step_context(req_ids=req_ids, ctx=ctx)
+
+    def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
+        self._gdn_state_manager.extend_forward_eval_outputs(outputs)
+
+    def release_requests(self, req_ids: set[str]) -> None:
+        self._gdn_state_manager.release_requests(req_ids)
+
+    def materialize_pending_state(self) -> None:
+        self._gdn_state_manager.materialize_pending_state()
+
+
+class ForwardOutputRuntimeStub:
+    def __init__(self, arrays: list[mx.array]) -> None:
+        self._arrays = arrays
+
+    def needs_step_context(self) -> bool:
+        return False
+
+    def populate_step_context(self, *, req_ids: list[str], ctx) -> None:
+        del req_ids, ctx
+
+    def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
+        outputs.extend(self._arrays)
+
+    def release_requests(self, req_ids: set[str]) -> None:
+        del req_ids
+
+    def materialize_pending_state(self) -> None:
+        return None
 
 
 class TestV1MetalModelRunnerGenerate:
@@ -359,8 +400,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             initial_seqs=0,
             dtype=mx.float32,
         )
-        backend = _HybridBackendStub.__new__(_HybridBackendStub)
-        backend._state_cache = state_cache
+        backend = HybridRuntimeStub(state_cache)
         runner = make_stub_runner(
             tokenizer=object(),
             model_args={"full_attention_interval": 2},
@@ -402,7 +442,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             )
 
         assert mr.get_context() is None
-        assert runner._gdn_req_to_slot == {}
+        assert backend.gdn_state_manager.request_slots == {}
 
     def test_start_paged_forward_collects_hidden_states_for_gemma4_mtp(
         self, monkeypatch
@@ -1113,7 +1153,13 @@ class TestV1MetalModelRunnerExecuteModel:
 
     def test_paged_spec_decode_failure_does_not_mutate_request_setup(self) -> None:
         runner = self._make_runner()
-        runner._paged_attention_runtime = object()
+        runner._paged_attention_runtime = MHAPagedAttentionRuntime(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            block_size=4,
+            dtype=mx.float32,
+        )
         req_state = mr.RequestState(
             token_ids=[1, 6],
             prompt_len=1,
@@ -1165,8 +1211,7 @@ class TestV1MetalModelRunnerExecuteModel:
 
 
 class TestV1MetalModelRunnerGDNSubmit:
-    def _make_hybrid_backend(self) -> HybridPagedAttentionRuntime:
-        backend = _HybridBackendStub.__new__(_HybridBackendStub)
+    def make_runtime_with_side_effects(self) -> ForwardOutputRuntimeStub:
         conv_states = [
             mx.array([1], dtype=mx.float32),
             mx.array([2], dtype=mx.float32),
@@ -1175,17 +1220,11 @@ class TestV1MetalModelRunnerGDNSubmit:
             mx.array([3], dtype=mx.float32),
             mx.array([4], dtype=mx.float32),
         ]
-        backend._state_cache = SimpleNamespace(
-            conv_states=conv_states,
-            recurrent_states=recurrent_states,
-            updated_state_arrays=lambda: [*conv_states, *recurrent_states],
-        )
-        return backend
+        return ForwardOutputRuntimeStub([*conv_states, *recurrent_states])
 
     def test_prefill_hybrid_submits_pending_compact_gdn_states(
         self, monkeypatch
     ) -> None:
-        # Arrange
         submitted: list[tuple[object, ...]] = []
         cache = GDNPagedStateCache(
             num_layers=1,
@@ -1195,22 +1234,21 @@ class TestV1MetalModelRunnerGDNSubmit:
             num_v_heads=1,
             value_head_dim=4,
             key_head_dim=32,
+            initial_seqs=0,
             dtype=mx.float32,
         )
         pending_conv = mx.full((1, 1, 4), 7, dtype=mx.float32)
         pending_recurrent = mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+        cache.ensure_capacity(2)
         cache.set_pending_conv_state(0, [1], pending_conv)
         cache.set_pending_recurrent_state(0, [1], pending_recurrent)
-        backend = _HybridBackendStub.__new__(_HybridBackendStub)
-        backend._state_cache = cache
+        backend = HybridRuntimeStub(cache)
         runner = make_stub_runner(_paged_attention_runtime=backend)
         logits = mx.array([0], dtype=mx.float32)
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
-        # Act
         runner._submit_paged_forward_outputs(logits)
 
-        # Assert
         assert len(submitted) == 1
         assert submitted[0][1] is pending_conv
         assert submitted[0][2] is pending_recurrent
@@ -1218,17 +1256,15 @@ class TestV1MetalModelRunnerGDNSubmit:
         assert cache.has_pending_recurrent_state(0)
 
     def test_hybrid_submits_logits_and_updated_gdn_states(self, monkeypatch) -> None:
-        # Arrange
         submitted: list[tuple[object, ...]] = []
-        runner = make_stub_runner(_paged_attention_runtime=self._make_hybrid_backend())
+        runtime = self.make_runtime_with_side_effects()
+        runner = make_stub_runner(_paged_attention_runtime=runtime)
         logits = mx.array([0], dtype=mx.float32)
-        expected_states = runner._gdn_updated_state_arrays()
+        expected_states = runtime._arrays
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
-        # Act
         runner._submit_paged_forward_outputs(logits)
 
-        # Assert
         assert len(submitted) == 1
         assert submitted[0][0] is logits
         assert len(submitted[0][1:]) == len(expected_states)
@@ -1236,20 +1272,93 @@ class TestV1MetalModelRunnerGDNSubmit:
             assert actual is expected
 
     def test_prefill_non_hybrid_submits_logits_only(self, monkeypatch) -> None:
-        # Arrange
         submitted: list[tuple[object, ...]] = []
-        runner = make_stub_runner(_paged_attention_runtime=object())
+        runner = make_stub_runner(
+            _paged_attention_runtime=MHAPagedAttentionRuntime(
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=4,
+                block_size=4,
+                dtype=mx.float32,
+            )
+        )
         logits = mx.array([0], dtype=mx.float32)
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
-        # Act
         runner._submit_paged_forward_outputs(logits)
 
-        # Assert
         assert submitted == [(logits,)]
 
-    def test_release_applies_pending_gdn_states_before_reuse(self) -> None:
-        # Arrange
+
+class TestV1MetalModelRunnerGDNLifecycle:
+    def test_start_paged_forward_assigns_hybrid_slots_in_batch_order(
+        self, monkeypatch
+    ) -> None:
+        cache = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=4,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            initial_seqs=0,
+            dtype=mx.float32,
+        )
+        runtime = HybridRuntimeStub(cache)
+        runner = make_stub_runner(_paged_attention_runtime=runtime)
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        runner._paged_request_seq_lens["decode-0"] = 1
+
+        captured: dict[str, object] = {}
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache, collect_hidden_states
+            ctx = mr.get_context()
+            assert ctx is not None
+            captured["input_ids"] = input_ids.tolist()
+            captured["gdn_slot_mapping"] = list(ctx.gdn_slot_mapping or [])
+            return mr.TargetModelForwardOutput(logits=mx.zeros((1, 2, 16)))
+
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        decode_state = mr.RequestState(
+            token_ids=[5, 6],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            generated_tokens=1,
+        )
+        decode_state.block_ids = [0]
+        prefill = mr.PrefillRequest(
+            req_id="prefill-0",
+            token_ids=[9],
+            sampling_params=SamplingParams(),
+            block_ids=[1],
+            generator=None,
+            prompt_len=1,
+            start_pos=0,
+            full_prompt_token_ids=[9],
+        )
+        scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={})
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[prefill],
+            decode_reqs=[("decode-0", decode_state)],
+            scheduler_output=scheduler_output,
+        )
+
+        assert captured["input_ids"] == [[6, 9]]
+        assert captured["gdn_slot_mapping"] == [0, 1]
+        assert runtime.gdn_state_manager.request_slots == {
+            "decode-0": 0,
+            "prefill-0": 1,
+        }
+
+    def test_sample_tokens_materializes_reused_slot_state(self, monkeypatch) -> None:
         cache = GDNPagedStateCache(
             num_layers=1,
             max_seqs=2,
@@ -1258,29 +1367,57 @@ class TestV1MetalModelRunnerGDNSubmit:
             num_v_heads=1,
             value_head_dim=4,
             key_head_dim=32,
+            initial_seqs=0,
             dtype=mx.float32,
         )
-        cache.set_pending_conv_state(0, [1], mx.full((1, 1, 4), 7, dtype=mx.float32))
-        cache.set_pending_recurrent_state(
-            0, [1], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+        runtime = HybridRuntimeStub(cache)
+        runner = make_stub_runner(_paged_attention_runtime=runtime)
+        runner._execute_model_state = object()
+        runner._request_states["done"] = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            generated_tokens=0,
         )
-        backend = _HybridBackendStub.__new__(_HybridBackendStub)
-        backend._state_cache = cache
-        runner = make_stub_runner(_paged_attention_runtime=backend)
-        runner._gdn_req_to_slot = {"done": 1}
-        runner._gdn_free_slots = []
+        runner._paged_request_seq_lens["done"] = 1
 
-        # Act
-        runner._gdn_release_slots({"done"})
+        released_slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        runner._cleanup_finished_requests({"done"}, materialize_runtime_state=False)
+        reused_slot = runtime.gdn_state_manager.assign_step_slots(["next"])[0]
+        assert reused_slot == released_slot
 
-        # Assert
+        cache.set_pending_conv_state(
+            0, [reused_slot], mx.full((1, 1, 4), 7, dtype=mx.float32)
+        )
+        cache.set_pending_recurrent_state(
+            0,
+            [reused_slot],
+            mx.full((1, 1, 4, 32), 9, dtype=mx.float32),
+        )
+
+        expected_output = object()
+        monkeypatch.setattr(
+            runner,
+            "_sample_paged_batch",
+            lambda grammar_output: (mr._ExecutionBatch(), object()),
+        )
+        monkeypatch.setattr(runner, "_validate_scheduled_outputs", lambda *args: None)
+        monkeypatch.setattr(runner, "_build_output", lambda batch: expected_output)
+
+        output = runner.sample_tokens(None)
+
+        assert output is expected_output
         assert not cache.has_pending_conv_state(0)
         assert not cache.has_pending_recurrent_state(0)
         mx.eval(cache.conv_states[0], cache.recurrent_states[0])
-        np.testing.assert_array_equal(np.array(cache.conv_states[0][1]), 7)
-        np.testing.assert_array_equal(np.array(cache.recurrent_states[0][1]), 9)
-        assert runner._gdn_free_slots == [1]
-        assert runner._gdn_needs_materialize
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][reused_slot]), 7)
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0][reused_slot]),
+            9,
+        )
+        assert runtime.gdn_state_manager.needs_materialize is False
 
 
 class TestRunnerMlaProperties:
